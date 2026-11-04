@@ -349,6 +349,55 @@ PREAMBLE = (
     "- When done, reply with one or two sentences describing exactly what you changed."
 )
 
+# Ask / Plan modes (README §6 "Ask & Plan modes"): `/design` takes an optional top-level `mode`.
+# claude and grok run them READ-ONLY at the tool layer (write/shell tools removed); codex runs them
+# normally, guided by these preambles. Every provider's Ask request is prefixed `QUESTION ONLY: `
+# (run_design). Ask just answers; Plan's final reply IS the plan, which the SHIM writes as one new .md
+# file in the repo. These replace PREAMBLE for their runs; same generic spirit — mirror edits in
+# shim/slide-write.mjs.
+ASK_PREAMBLE = (
+    "You are answering a question about a web app from within its running dev environment, with the "
+    "repo at the working directory.\n\n"
+    "This is a READ-ONLY request. Do NOT create, modify, move, or delete any file, and do not run anything "
+    "that changes state (installs, builds, migrations, git commits/checkouts).\n\n"
+    "FIRST, read the repo's CLAUDE.md / AGENTS.md (and README) for THIS project's conventions and layout.\n\n"
+    "- Investigate the code as needed, then answer the question directly and concisely.\n"
+    "- Cite code as repo-relative `path:line`.\n"
+    "- If the answer calls for a code change, describe it — do not make it."
+)
+PLAN_PREAMBLE = (
+    "You are planning a change to a web app from within its running dev environment, with the repo at "
+    "the working directory.\n\n"
+    "This is a planning request: do NOT implement the change, and do not create, modify, move, or delete "
+    "any file or run anything that changes state. Your final reply IS the plan; Slide Write saves it into "
+    "the repo for you.\n\n"
+    "FIRST, read the repo's CLAUDE.md / AGENTS.md (and README) for THIS project's conventions — including "
+    "where documentation, specs, or plans belong and how they are named.\n\n"
+    "- Investigate the relevant code, then write an implementation plan for the request: the goal, the files "
+    "to change (repo-relative paths) and what changes in each, ordered steps, risks / open questions, and "
+    "how to verify the result.\n"
+    "- Your FINAL reply must contain only the plan. Its first line must be exactly "
+    "`PLAN_PATH: <repo-relative path ending in .md>` — where CLAUDE.md / AGENTS.md say plans or docs belong "
+    "(following their naming convention), otherwise the default location given with the request. Then a "
+    "blank line, then the plan in Markdown, starting with a `# ` title."
+)
+# Advertised in /meta so a client never sends a mode that an older shim would run as an edit.
+MODES = ("design", "ask", "plan")
+
+
+def run_mode(body):
+    m = body.get("mode")
+    return "design" if m is None or m == "" else str(m)
+
+
+def preamble_for(mode):
+    return ASK_PREAMBLE if mode == "ask" else PLAN_PREAMBLE if mode == "plan" else PREAMBLE
+
+
+# Read-only built-in tool allowlists. A tool absent from the list doesn't exist for the run.
+READ_ONLY_TOOLS = ("Read", "Grep", "Glob", "WebFetch", "WebSearch")
+GROK_READ_ONLY_TOOLS = ("read_file", "grep", "list_dir", "web_fetch")
+
 
 def git(repo, *a):
     try:
@@ -712,8 +761,10 @@ def codex_sessions_dir():
 # show the actual request (matches claude, whose PREAMBLE rides in systemPrompt, not the message).
 def strip_preamble(text):
     t = text or ""
-    if t.startswith(PREAMBLE):
-        t = t[len(PREAMBLE):]
+    for p in (PREAMBLE, ASK_PREAMBLE, PLAN_PREAMBLE):  # Ask/Plan runs carry their own
+        if t.startswith(p):
+            t = t[len(p):]
+            break
     return t.strip()
 
 
@@ -852,6 +903,7 @@ def read_codex_history(repo, sid):
         return None
     events = []
     last_agent = None
+    streamed = False  # some agent text went out as a delta
     had_error = False
     for line in lines:
         try:
@@ -866,7 +918,7 @@ def read_codex_history(repo, sid):
                 events.append({"type": "user", "text": txt})
         elif t == "event_msg" and pt == "agent_message":
             if p.get("message"):
-                last_agent = p["message"]
+                last_agent, streamed = p["message"], True
                 events.append({"type": "delta", "text": p["message"]})
         elif t == "event_msg" and pt == "patch_apply_end":
             for path in (p.get("changes") or {}):
@@ -901,7 +953,7 @@ def read_codex_history(repo, sid):
             elif kind == "AgentMessage":
                 txt = item_text(it)
                 if txt:
-                    last_agent = txt
+                    last_agent, streamed = txt, True
                     events.append({"type": "delta", "text": txt})
             elif kind == "Reasoning":
                 for entry in it.get("summary_text") or []:
@@ -915,8 +967,10 @@ def read_codex_history(repo, sid):
             elif kind == "CommandExecution":
                 events.append({"type": "tool", "tool": "codex_exec",
                                "detail": item_command(it), "id": it.get("id")})
+    # §6: `result` carries text only as a fallback when none was replayed as a delta — otherwise the
+    # panel appends it again and the final answer shows twice.
     events.append({"type": "result", "isError": had_error, "numTurns": None, "durationMs": None,
-                   "totalCostUsd": None, "usage": None, "result": last_agent})
+                   "totalCostUsd": None, "usage": None, "result": None if streamed else last_agent})
     return {"id": sid, "events": events}
 
 
@@ -1098,7 +1152,6 @@ def read_grok_history(repo, sid):
     except OSError:
         return None
     events = []
-    last_text = None
     for line in lines:
         try:
             rec = json.loads(line)
@@ -1120,7 +1173,6 @@ def read_grok_history(repo, sid):
                 events.append({"type": "thinking_delta", "text": rtxt})
         elif t == "assistant":
             if isinstance(rec.get("content"), str) and rec["content"]:
-                last_text = rec["content"]
                 events.append({"type": "delta", "text": rec["content"]})
             for tc in rec.get("tool_calls") or []:
                 raw = tc.get("arguments") or "{}"
@@ -1142,8 +1194,10 @@ def read_grok_history(repo, sid):
             events.append({"type": "tool", "tool": rec.get("name") or "backend_tool",
                            "detail": rec.get("detail") if isinstance(rec.get("detail"), str) else "",
                            "id": rec.get("id")})
+    # §6: every assistant text was already replayed as a delta, so `result` carries none (a copy here
+    # made the panel show the final answer twice).
     events.append({"type": "result", "isError": False, "numTurns": None, "durationMs": None,
-                   "totalCostUsd": None, "usage": None, "result": last_text})
+                   "totalCostUsd": None, "usage": None, "result": None})
     return {"id": sid, "events": events}
 
 
@@ -1188,7 +1242,7 @@ def generate_image(prompt, key, image=None):
 # run_design and run_image so the event contract lives in one place. The CLI's stream-json output is
 # the same message stream the Node Agent SDK yields, so the mapping below mirrors slide-write.mjs
 # line for line; the prompt goes in on stdin (no argv size/quoting worries).
-def stream_query(repo, prompt, body, emit, aborted):
+def stream_query(repo, prompt, body, emit, aborted, mode="design"):
     tool = {}
     streamed_text = had_error = saw_result = False
     # Live token feed for the client's running counter (§6 `usage`, cumulative). Authoritative
@@ -1222,9 +1276,16 @@ def stream_query(repo, prompt, body, emit, aborted):
     cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
            "--dangerously-skip-permissions",       # runs as you (non-root) → allowed, no callback
            "--setting-sources", "project",         # project CLAUDE.md only, like the SDK shim
-           "--system-prompt", PREAMBLE, "--max-turns", "40"]
+           "--system-prompt", preamble_for(mode), "--max-turns", "40"]
     if not USE_SKILLS:
         cmd.append("--disable-slash-commands")     # CLI loads skills by default; mirror the SDK's opt-in
+    if mode != "design":
+        # Ask/Plan: only read tools exist (Skill rides along when skills are on — it only loads
+        # instructions), the write/shell tools are denied outright, and no MCP servers load.
+        tools = READ_ONLY_TOOLS + (("Skill",) if USE_SKILLS else ())
+        cmd += ["--tools", ",".join(tools),
+                "--disallowedTools", ",".join(EDIT_TOOLS + ("Bash",)),
+                "--strict-mcp-config"]
     if model:
         cmd += ["--model", model]
     if effort:
@@ -1333,8 +1394,11 @@ def stream_query(repo, prompt, body, emit, aborted):
 # §6 SSE contract stream_query emits. Spawns the codex CLI, which reuses CODEX_HOME/auth.json for its
 # ChatGPT-oauth login (no API key here). Returns whether the run errored. The generic PREAMBLE is
 # prepended to the prompt (codex exec has no separate system-prompt flag). Mirrors streamCodex in .mjs.
-def stream_codex(repo, prompt, body, emit, aborted):
+def stream_codex(repo, prompt, body, emit, aborted, mode="design"):
     model, effort = requested_model(body), requested_effort(body)
+    # Every mode runs codex the same way. Ask/Plan aren't sandboxed here (unlike claude/grok, which get
+    # read-only tool allowlists) — they rely on ASK_PREAMBLE / PLAN_PREAMBLE plus run_design's
+    # `QUESTION ONLY:` prefix, and its porcelain backstop reports (never commits) any stray Ask change.
     cmd = [CODEX_BIN, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
            "--skip-git-repo-check", "-C", repo]
     if model:
@@ -1355,12 +1419,14 @@ def stream_codex(repo, prompt, body, emit, aborted):
         emit("error", {"message": f"could not start `{CODEX_BIN}`: {e}"})
         return True
 
-    state = {"had_error": False, "last_text": "", "started": False}
+    # in_text: an agent_message already streamed since the last tool row, so the next one needs a
+    # paragraph break — codex messages arrive whole and would otherwise run together in one bubble.
+    state = {"had_error": False, "in_text": False, "started": False}
     err_tail = deque(maxlen=40)
 
     def feed():
         try:
-            proc.stdin.write(PREAMBLE + "\n\n" + prompt)
+            proc.stdin.write(preamble_for(mode) + "\n\n" + prompt)
             proc.stdin.close()
         except OSError:
             pass
@@ -1380,16 +1446,18 @@ def stream_codex(repo, prompt, body, emit, aborted):
             it = ev.get("item") or {}
             kind = it.get("type")
             if kind == "file_change":
+                state["in_text"] = False
                 for c in it.get("changes") or []:
                     emit("file_edit", {"tool": "codex", "path": rel_path(repo, c.get("path", "")), "id": it.get("id")})
             elif kind == "agent_message":
                 if it.get("text"):
-                    state["last_text"] = it["text"]
-                    emit("delta", {"text": it["text"]})
+                    emit("delta", {"text": ("\n\n" if state["in_text"] else "") + it["text"]})
+                    state["in_text"] = True
             elif kind == "reasoning":
                 if it.get("text"):
                     emit("thinking_delta", {"text": it["text"]})
             elif kind == "command_execution":
+                state["in_text"] = False
                 emit("tool", {"tool": "codex_exec", "detail": it.get("command") or it.get("aggregated_output") or "",
                               "id": it.get("id")})
             elif kind == "error":
@@ -1426,7 +1494,9 @@ def stream_codex(repo, prompt, body, emit, aborted):
         if not state["started"]:
             state["had_error"] = True
             emit("error", {"message": "".join(err_tail)[-500:].strip() or "codex did not start"})
-        emit("result", {"isError": state["had_error"], "result": state["last_text"] or None})
+        # §6: `result.result` is only a fallback for text that never streamed. Every agent_message
+        # already went out as a `delta`, so repeating the last one here showed it twice in the panel.
+        emit("result", {"isError": state["had_error"], "result": None})
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -1437,7 +1507,7 @@ def stream_codex(repo, prompt, body, emit, aborted):
 # --include-partial-messages (Claude-like; frozen against grok 1.0.3 — see
 # shim/fixtures/grok-streaming-messages-edit.jsonl). Large prompts go through --prompt-file.
 # PREAMBLE is prepended into that file. Auth is host-only: grok login / XAI_API_KEY env.
-def stream_grok(repo, prompt, body, emit, aborted):
+def stream_grok(repo, prompt, body, emit, aborted, mode="design"):
     model, effort = requested_model(body), requested_effort(body)
     try:
         abs_repo = os.path.realpath(repo)
@@ -1449,7 +1519,7 @@ def stream_grok(repo, prompt, body, emit, aborted):
         f"slidewrite-grok-prompt-{int(time.time() * 1000)}-{secrets.token_hex(4)}.txt")
     try:
         with open(prompt_file, "w", encoding="utf-8") as fh:
-            fh.write(PREAMBLE + "\n\n" + prompt)
+            fh.write(preamble_for(mode) + "\n\n" + prompt)
     except OSError as e:
         emit("error", {"message": f"could not write grok prompt file: {e}"})
         return True
@@ -1469,6 +1539,8 @@ def stream_grok(repo, prompt, body, emit, aborted):
         cmd += ["-m", model]
     if effort:
         cmd += ["--effort", effort]
+    if mode != "design":
+        cmd += ["--tools", ",".join(GROK_READ_ONLY_TOOLS)]  # Ask/Plan: only read tools exist
     if valid_session_id(body.get("resume")):
         cmd += ["-r", body["resume"]]
     env = dict(os.environ)
@@ -1612,15 +1684,16 @@ def stream_grok(repo, prompt, body, emit, aborted):
 
 
 # Provider dispatch for the agent step. Explicit allow-list — unknown providers hard-error (no
-# silent Claude fallthrough). Shared by run_design and run_image.
-def run_agent(repo, prompt, body, emit, aborted):
+# silent Claude fallthrough). Shared by run_design and run_image. `mode` ("design" | "ask" | "plan")
+# picks the preamble and, for ask/plan, the provider's read-only tool restriction.
+def run_agent(repo, prompt, body, emit, aborted, mode="design"):
     provider = body.get("provider") or "anthropic"
     if provider == "anthropic":
-        return stream_query(repo, prompt, body, emit, aborted)
+        return stream_query(repo, prompt, body, emit, aborted, mode)
     if provider == "openai":
-        return stream_codex(repo, prompt, body, emit, aborted)
+        return stream_codex(repo, prompt, body, emit, aborted, mode)
     if provider == "grok":
-        return stream_grok(repo, prompt, body, emit, aborted)
+        return stream_grok(repo, prompt, body, emit, aborted, mode)
     if provider == "google":
         emit("error", {"message": "Google provider is not yet supported"})
         return True
@@ -1663,21 +1736,165 @@ def save_screenshot(element, n=0):
     return tmp_path
 
 
+# --- Plan files (mode "plan") ----------------------------------------------------------------
+# The agent only PROPOSES a path (its reply's first line, `PLAN_PATH: …`); the shim validates it and
+# writes the file itself, so a Plan run's sole write is one NEW .md inside the repo. Default when the
+# target repo's CLAUDE.md / AGENTS.md don't say where plans go: the first existing dir below, else
+# the repo root.
+PLAN_DIRS = ("docs/plans", "spec/plans", "specs/plans", "docs")
+
+
+def default_plan_path(repo, prompt):
+    d = next((x + "/" for x in PLAN_DIRS if os.path.isdir(os.path.join(repo, x))), "")
+    slug = re.sub(r"[^a-z0-9]+", "-", str(prompt or "").split("\n")[0].lower())[:48].strip("-") or "plan"
+    return f"{d}{time.strftime('%Y-%m-%d')}-{slug}.md"
+
+
+# A proposed plan path is accepted only if it's repo-relative, plain ASCII (letters, digits, `._-`),
+# ends in .md, isn't under node_modules, and no segment starts with a dot — which rules out `..`,
+# absolute paths, and .git / .claude / .env. Returns the normalized path or None.
+PLAN_PATH_RE = re.compile(r"(?:[A-Za-z0-9_][A-Za-z0-9._-]*/)*[A-Za-z0-9_][A-Za-z0-9._-]*\.md", re.I)
+
+
+def clean_plan_path(p):
+    s = re.sub(r"^\./", "", str(p or "").strip().replace("\\", "/"))
+    return s if PLAN_PATH_RE.fullmatch(s) and "node_modules" not in s.split("/") else None
+
+
+# True when `rel` stays inside the repo even through symlinks: realpath the target's nearest
+# existing ancestor and require it under realpath(repo).
+def inside_repo(repo, rel):
+    root = os.path.realpath(repo)
+    d = os.path.dirname(os.path.join(root, rel))
+    while True:
+        if os.path.exists(d):
+            r = os.path.realpath(d)
+            return r == root or r.startswith(root + os.sep)
+        up = os.path.dirname(d)
+        if up == d:
+            return False
+        d = up
+
+
+# Split the agent's final reply into the proposed path and the plan body. Tolerates the path line
+# wrapped in emphasis/backticks and a fenced plan; with no path line, chatter before the first
+# `# ` heading is dropped.
+def extract_plan(text):
+    t = str(text or "").replace("\r\n", "\n")
+    path = None
+    m = re.search(r"^[ \t>*_`]*PLAN_PATH:[ \t*_`]*([^\s`*]+)[ \t*_`]*$", t, re.M)
+    if m:
+        path, t = m.group(1), t[m.end():]
+    else:
+        h = re.search(r"^# ", t, re.M)
+        if h:
+            t = t[h.start():]
+    t = t.strip()
+    fence = re.fullmatch(r"```[\w-]*\n([\s\S]*?)\n```", t)
+    return path, (fence.group(1) if fence else t).strip()
+
+
+# Write the plan as a NEW file at the first acceptable of: the agent's path, the default, the
+# default's filename at the repo root. Never overwrites — a taken name gets -2, -3, … Returns the
+# repo-relative path written.
+def save_plan(repo, proposed, fallback, text):
+    rel = next((c for c in (clean_plan_path(proposed), fallback, os.path.basename(fallback))
+                if c and inside_repo(repo, c)), None)
+    if not rel:
+        raise OSError("no writable location inside the repo")
+    os.makedirs(os.path.join(repo, os.path.dirname(rel)), exist_ok=True)
+    for n in range(1, 100):
+        candidate = rel if n == 1 else f"{rel[:-3]}-{n}.md"
+        try:
+            with open(os.path.join(repo, candidate), "x", encoding="utf-8", newline="") as fh:
+                fh.write(text + "\n")
+            return candidate
+        except FileExistsError:
+            continue
+    raise OSError(f"{rel} and its numbered variants already exist")
+
+
+# Tap an emit to recover the agent's FINAL reply, provider-agnostically: the text streamed since the
+# last tool call, unless the `result` event carries it (codex always does; claude/grok only when
+# nothing streamed). Returns (tapped_emit, get_text).
+def final_text_tap(emit):
+    st = {"since": "", "final": None}
+
+    def tap(t, d=None):
+        d = d or {}
+        if t == "delta":
+            st["since"] += d.get("text") or ""
+        elif t in ("tool", "file_edit"):
+            st["since"] = ""
+        elif t == "result" and d.get("result"):
+            st["final"] = d["result"]
+        emit(t, d)
+
+    return tap, lambda: st["final"] or st["since"]
+
+
 # Core: drive one design run. `emit(type, data)` sends an SSE event; `aborted()` lets the caller
 # cancel (client disconnect). Module-level so the HTTP handler and tests share one implementation.
 # `repo` defaults to the single-repo REPO; the HTTP layer passes the Host-resolved repo.
+# `body["mode"]` "ask" / "plan" makes it a read-only run (see ASK_PREAMBLE / PLAN_PREAMBLE).
 def run_design(body, emit, aborted=lambda: False, repo=None):
     repo = repo or REPO
+    mode = run_mode(body)
+    # An unknown mode is refused, never run as an edit: a newer client may mean something read-only.
+    if mode not in MODES:
+        emit("error", {"message": f'Unknown mode "{mode}" — upgrade the shim'})
+        return emit("done")
     dirty0 = set(porcelain_paths(repo))
     elements = elements_of(body)
     shot_paths = [save_screenshot(el, i) for i, el in enumerate(elements)]
-    had_error = run_agent(repo, build_prompt(body, elements, shot_paths), body, emit, aborted)
+    # Ask: every provider's request leads with `QUESTION ONLY: ` (after the preamble, before the text).
+    prompt = ("QUESTION ONLY: " if mode == "ask" else "") + build_prompt(body, elements, shot_paths)
+    plan_default = default_plan_path(repo, body.get("prompt")) if mode == "plan" else None
+    if plan_default:
+        prompt += ("\n\n[Plan file: unless CLAUDE.md / AGENTS.md say plans or docs belong elsewhere, "
+                   f"use PLAN_PATH: {plan_default}]")
+    run_emit, final_text = final_text_tap(emit) if mode == "plan" else (emit, None)
+    had_error = run_agent(repo, prompt, body, run_emit, aborted, mode)
     if aborted():
         return
-    # `autoCommit: false` (extension per-origin option) leaves the edits uncommitted in the working
-    # tree; absent/anything-else keeps the original auto-commit behavior.
-    if not had_error and body.get("autoCommit") is not False:
-        commit_changed(repo, dirty0, (body.get("prompt") or "design change").split("\n")[0][:72], emit)
+    if mode == "design":
+        # `autoCommit: false` (extension per-origin option) leaves the edits uncommitted in the working
+        # tree; absent/anything-else keeps the original auto-commit behavior.
+        if not had_error and body.get("autoCommit") is not False:
+            commit_changed(repo, dirty0, (body.get("prompt") or "design change").split("\n")[0][:72], emit)
+        return emit("done")
+    # Ask / Plan never commit the agent's own edits (claude/grok can't make any; codex is only told not
+    # to). Diff the tree as a backstop and report anything that changed — left untouched.
+    dirty1 = porcelain_paths(repo)
+    stray = [p for p in dirty1 if p not in dirty0]
+    path, plan = extract_plan(final_text()) if mode == "plan" else (None, None)
+    # A Plan agent with write access (codex) may save the plan itself at the PLAN_PATH it names — adopt
+    # that file rather than writing a duplicate `-2` beside it and flagging it as stray.
+    proposed = clean_plan_path(path) if mode == "plan" else None
+    adopted = proposed if proposed and proposed in stray else None
+    if adopted:
+        stray = [p for p in stray if p != adopted]
+    if stray:
+        emit("error", {"message": f"The working tree changed during this {'Ask' if mode == 'ask' else 'Plan'} run "
+                                  "(left uncommitted): " + ", ".join(stray[:10]) + (", …" if len(stray) > 10 else "")})
+    plan_subj = "plan — " + (body.get("prompt") or "plan").split("\n")[0][:72]
+    if adopted:
+        emit("plan_saved", {"path": adopted})
+        if not had_error and body.get("autoCommit") is not False:
+            commit_changed(repo, {p for p in dirty1 if p != adopted}, plan_subj, emit)
+    elif mode == "plan":
+        if had_error or not plan:
+            emit("error", {"message": "plan not saved — " + (
+                "the run ended with an error" if had_error else "the agent returned no plan text")})
+        else:
+            try:
+                rel = save_plan(repo, path, plan_default, plan)
+                emit("plan_saved", {"path": rel})
+                # Commit only the plan file: anything already dirty after the run (dirty1) is excluded.
+                if body.get("autoCommit") is not False:
+                    commit_changed(repo, set(dirty1), plan_subj, emit)
+            except OSError as e:
+                emit("error", {"message": f"plan not saved — {e}"})
     emit("done")
 
 
@@ -1767,6 +1984,8 @@ class Handler(BaseHTTPRequestHandler):
                 "project": os.path.basename(repo), "repoDir": repo, "version": VERSION,
                 "branch": git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
                 "dirty": bool(git(repo, "status", "--porcelain")),
+                # `/design` run modes this shim honors; the panel only offers Ask/Plan when listed
+                "modes": list(MODES),
                 **model_meta,  # legacy top-level models/defaultModel = discovered Anthropic list
                 "geminiModel": GEMINI_MODEL, "geminiEnv": bool(GEMINI_KEY),  # geminiEnv: server-side key fallback
             })

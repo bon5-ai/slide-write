@@ -6,8 +6,8 @@ import http from "node:http";
 import os from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { open, readdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
-import { basename, join, resolve, sep } from "node:path";
+import { mkdir, open, readdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
@@ -265,7 +265,45 @@ const PREAMBLE =
   "- Keep schema/model changes ADDITIVE; never rename, drop, or retype an existing table or column.\n" +
   "- When done, reply with one or two sentences describing exactly what you changed.";
 
-const git = (repo, ...a) => new Promise(r => execFile("git", ["-C", repo, ...a], (_e, out) => r((out || "").trim())));
+// Ask / Plan modes (README §6 "Ask & Plan modes"): `/design` takes an optional top-level `mode`.
+// claude and grok run them READ-ONLY at the tool layer (write/shell tools removed); codex runs them
+// normally, guided by these preambles. Every provider's Ask request is prefixed `QUESTION ONLY: `
+// (runDesign). Ask just answers; Plan's final reply IS the plan, which the SHIM writes as one new .md
+// file in the repo. These replace PREAMBLE for their runs; same generic spirit — mirror edits in
+// shim/slide-write.py.
+const ASK_PREAMBLE =
+  "You are answering a question about a web app from within its running dev environment, with the " +
+  "repo at the working directory.\n\n" +
+  "This is a READ-ONLY request. Do NOT create, modify, move, or delete any file, and do not run anything " +
+  "that changes state (installs, builds, migrations, git commits/checkouts).\n\n" +
+  "FIRST, read the repo's CLAUDE.md / AGENTS.md (and README) for THIS project's conventions and layout.\n\n" +
+  "- Investigate the code as needed, then answer the question directly and concisely.\n" +
+  "- Cite code as repo-relative `path:line`.\n" +
+  "- If the answer calls for a code change, describe it — do not make it.";
+const PLAN_PREAMBLE =
+  "You are planning a change to a web app from within its running dev environment, with the repo at " +
+  "the working directory.\n\n" +
+  "This is a planning request: do NOT implement the change, and do not create, modify, move, or delete " +
+  "any file or run anything that changes state. Your final reply IS the plan; Slide Write saves it into " +
+  "the repo for you.\n\n" +
+  "FIRST, read the repo's CLAUDE.md / AGENTS.md (and README) for THIS project's conventions — including " +
+  "where documentation, specs, or plans belong and how they are named.\n\n" +
+  "- Investigate the relevant code, then write an implementation plan for the request: the goal, the files " +
+  "to change (repo-relative paths) and what changes in each, ordered steps, risks / open questions, and " +
+  "how to verify the result.\n" +
+  "- Your FINAL reply must contain only the plan. Its first line must be exactly " +
+  "`PLAN_PATH: <repo-relative path ending in .md>` — where CLAUDE.md / AGENTS.md say plans or docs belong " +
+  "(following their naming convention), otherwise the default location given with the request. Then a " +
+  "blank line, then the plan in Markdown, starting with a `# ` title.";
+// Advertised in /meta so a client never sends a mode that an older shim would run as an edit.
+const MODES = ["design", "ask", "plan"];
+const runMode = (body) => (body.mode == null || body.mode === "" ? "design" : String(body.mode));
+const preambleFor = (mode) => (mode === "ask" ? ASK_PREAMBLE : mode === "plan" ? PLAN_PREAMBLE : PREAMBLE);
+// Read-only built-in tool allowlists. A tool absent from the list doesn't exist for the run.
+const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "WebFetch", "WebSearch"];
+const GROK_READ_ONLY_TOOLS = ["read_file", "grep", "list_dir", "web_fetch"];
+
+const git =(repo, ...a) => new Promise(r => execFile("git", ["-C", repo, ...a], (_e, out) => r((out || "").trim())));
 // NB: parse porcelain UNtrimmed — `" M file"` starts with a space the status column needs.
 const porcelainPaths = (repo) => new Promise(r => execFile("git", ["-C", repo, "status", "--porcelain", "-uall"],
   (_e, out) => r((out || "").split("\n").filter(Boolean).map(l => l.slice(3)))));
@@ -529,7 +567,8 @@ const ROLLOUT_RE = /^rollout-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-([0
 // show the actual request (matches claude, whose PREAMBLE rides in systemPrompt, not the message).
 function stripPreamble(text) {
   let t = String(text || "");
-  if (t.startsWith(PREAMBLE)) t = t.slice(PREAMBLE.length);
+  const p = [PREAMBLE, ASK_PREAMBLE, PLAN_PREAMBLE].find((x) => t.startsWith(x));  // Ask/Plan runs carry their own
+  if (p) t = t.slice(p.length);
   return t.trim();
 }
 
@@ -635,7 +674,7 @@ async function readCodexHistory(repo, id) {
   const cwd = meta?.payload?.cwd;
   if (!cwd || resolve(cwd) !== repo) return null;             // don't replay another repo's transcript
   const events = [];
-  let lastAgent = null, hadError = false;
+  let lastAgent = null, streamed = false, hadError = false;   // streamed: some agent text went out as a delta
   for (const line of lines) {
     let rec; try { rec = JSON.parse(line); } catch { continue; }
     const p = rec.payload || {};
@@ -643,7 +682,7 @@ async function readCodexHistory(repo, id) {
       const t = stripPreamble(p.message);
       if (t) events.push({ type: "user", text: t });
     } else if (rec.type === "event_msg" && p.type === "agent_message") {
-      if (p.message) { lastAgent = p.message; events.push({ type: "delta", text: p.message }); }
+      if (p.message) { lastAgent = p.message; streamed = true; events.push({ type: "delta", text: p.message }); }
     } else if (rec.type === "event_msg" && p.type === "patch_apply_end") {
       for (const path of Object.keys(p.changes || {}))
         events.push({ type: "file_edit", tool: "codex", path: relPath(repo, path), id: p.call_id });
@@ -665,7 +704,7 @@ async function readCodexHistory(repo, id) {
         if (t) events.push({ type: "user", text: t });
       } else if (it.type === "AgentMessage") {
         const t = itemText(it);
-        if (t) { lastAgent = t; events.push({ type: "delta", text: t }); }
+        if (t) { lastAgent = t; streamed = true; events.push({ type: "delta", text: t }); }
       } else if (it.type === "Reasoning") {
         for (const s of it.summary_text || []) {
           const t = typeof s === "string" ? s : s?.text;
@@ -679,8 +718,10 @@ async function readCodexHistory(repo, id) {
       }
     }
   }
+  // §6: `result` carries text only as a fallback when none was replayed as a delta — otherwise the
+  // panel appends it again and the final answer shows twice.
   events.push({ type: "result", isError: hadError, numTurns: null, durationMs: null,
-    totalCostUsd: null, usage: null, result: lastAgent });
+    totalCostUsd: null, usage: null, result: streamed ? null : lastAgent });
   return { id, events };
 }
 
@@ -806,7 +847,6 @@ async function readGrokHistory(repo, id) {
   try { lines = (await readFile(join(hit.dir, "chat_history.jsonl"), "utf8")).split("\n").filter(Boolean); }
   catch { return null; }
   const events = [];
-  let lastText = null;
   for (const line of lines) {
     let rec; try { rec = JSON.parse(line); } catch { continue; }
     if (rec.type === "system") continue;
@@ -820,10 +860,7 @@ async function readGrokHistory(repo, id) {
       const t = reasoningSummaryText(rec.summary);
       if (t) events.push({ type: "thinking_delta", text: t });
     } else if (rec.type === "assistant") {
-      if (typeof rec.content === "string" && rec.content) {
-        lastText = rec.content;
-        events.push({ type: "delta", text: rec.content });
-      }
+      if (typeof rec.content === "string" && rec.content) events.push({ type: "delta", text: rec.content });
       for (const tc of rec.tool_calls || []) {
         let args = {};
         try { args = typeof tc.arguments === "string" ? JSON.parse(tc.arguments || "{}") : (tc.arguments || {}); }
@@ -840,8 +877,10 @@ async function readGrokHistory(repo, id) {
       events.push({ type: "tool", tool: rec.name || "backend_tool", detail: typeof rec.detail === "string" ? rec.detail : "", id: rec.id });
     }
   }
+  // §6: every assistant text was already replayed as a delta, so `result` carries none (a copy here
+  // made the panel show the final answer twice).
   events.push({ type: "result", isError: false, numTurns: null, durationMs: null,
-    totalCostUsd: null, usage: null, result: lastText });
+    totalCostUsd: null, usage: null, result: null });
   return { id, events };
 }
 
@@ -886,7 +925,7 @@ async function generateImage({ prompt, key, image, signal }) {
 
 // Drive one `claude` query, streaming the §6 SSE events. Returns whether the run errored. Shared by
 // runDesign and runImage so the event contract lives in one place.
-async function streamQuery(repo, prompt, body, emit, aborted) {
+async function streamQuery(repo, prompt, body, emit, aborted, mode = "design") {
   const tool = {}; let streamedText = false, hadError = false;
   // Live token feed for the client's running counter (§6 `usage`, cumulative). Authoritative
   // per-API-call usage lands with each assistant message — deduped by message id, since partials
@@ -913,8 +952,12 @@ async function streamQuery(repo, prompt, body, emit, aborted) {
   for await (const m of query({ prompt, options: {
     cwd: repo, permissionMode: "bypassPermissions",  // runs as you (non-root) → allowed, no callback
     allowDangerouslySkipPermissions: true,           // required by the SDK alongside bypassPermissions
-    includePartialMessages: true, settingSources: ["project"], systemPrompt: PREAMBLE, maxTurns: 40,
+    includePartialMessages: true, settingSources: ["project"], systemPrompt: preambleFor(mode), maxTurns: 40,
     ...(USE_SKILLS ? { skills: "all" } : {}),                         // load the target repo's project skills
+    // Ask/Plan: only read tools exist (Skill rides along when skills are on — it only loads
+    // instructions), the write/shell tools are denied outright, and no MCP servers load.
+    ...(mode !== "design" ? { tools: USE_SKILLS ? [...READ_ONLY_TOOLS, "Skill"] : READ_ONLY_TOOLS,
+      disallowedTools: [...EDIT_TOOLS, "Bash"], strictMcpConfig: true } : {}),
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
     ...(validSessionId(body.resume) ? { resume: body.resume } : {}),  // continue a prior session if asked
@@ -966,9 +1009,12 @@ async function streamQuery(repo, prompt, body, emit, aborted) {
 // Drive one `codex exec --json` run (the OpenAI provider), mapping codex's JSONL events onto the same
 // §6 SSE contract streamQuery emits. Spawns the codex CLI, which reuses CODEX_HOME/auth.json for its
 // ChatGPT-oauth login (no API key here). Returns whether the run errored. The generic PREAMBLE is
-// prepended to the prompt (codex exec has no separate system-prompt flag).
-async function streamCodex(repo, prompt, body, emit, aborted) {
+// prepended to the prompt (codex exec has no separate system-prompt flag; Ask/Plan swap in their own).
+async function streamCodex(repo, prompt, body, emit, aborted, mode = "design") {
   const model = requestedModel(body), effort = selectedEffort(body);
+  // Every mode runs codex the same way. Ask/Plan aren't sandboxed here (unlike claude/grok, which get
+  // read-only tool allowlists) — they rely on ASK_PREAMBLE / PLAN_PREAMBLE plus runDesign's
+  // `QUESTION ONLY:` prefix, and its porcelain backstop reports (never commits) any stray Ask change.
   const args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repo];
   if (model) args.push("-m", model);
   if (effort) args.push("-c", `model_reasoning_effort=${JSON.stringify(effort)}`);
@@ -981,18 +1027,20 @@ async function streamCodex(repo, prompt, body, emit, aborted) {
     let child;
     try { child = spawn(CODEX_BIN, args, { cwd: repo, env, stdio: ["pipe", "pipe", "pipe"] }); }
     catch (e) { emit("error", { message: `codex spawn failed: ${e?.message || e}` }); return done(true); }
-    let hadError = false, lastText = "", started = false, buf = "", stderr = "", finished = false;
-    child.stdin.write(PREAMBLE + "\n\n" + prompt); child.stdin.end();
+    // inText: an agent_message already streamed since the last tool row, so the next one needs a
+    // paragraph break — codex messages arrive whole and would otherwise run together in one bubble.
+    let hadError = false, inText = false, started = false, buf = "", stderr = "", finished = false;
+    child.stdin.write(preambleFor(mode) + "\n\n" + prompt); child.stdin.end();
     child.stdout.setEncoding("utf8");
 
     const handle = (ev) => {
       if (ev.type === "thread.started") { started = true; emit("start", { sessionId: ev.thread_id, model: model || body.model || "" }); }
       else if (ev.type === "item.completed") {
         const it = ev.item || {};
-        if (it.type === "file_change") for (const c of it.changes || []) emit("file_edit", { tool: "codex", path: relPath(repo, c.path || ""), id: it.id });
-        else if (it.type === "agent_message") { if (it.text) { lastText = it.text; emit("delta", { text: it.text }); } }
+        if (it.type === "file_change") { inText = false; for (const c of it.changes || []) emit("file_edit", { tool: "codex", path: relPath(repo, c.path || ""), id: it.id }); }
+        else if (it.type === "agent_message") { if (it.text) { emit("delta", { text: (inText ? "\n\n" : "") + it.text }); inText = true; } }
         else if (it.type === "reasoning") { if (it.text) emit("thinking_delta", { text: it.text }); }
-        else if (it.type === "command_execution") emit("tool", { tool: "codex_exec", detail: it.command || it.aggregated_output || "", id: it.id });
+        else if (it.type === "command_execution") { inText = false; emit("tool", { tool: "codex_exec", detail: it.command || it.aggregated_output || "", id: it.id }); }
         else if (it.type === "error") { hadError = true; emit("delta", { text: `\n[error] ${it.message || ""}` }); }
       }
       else if (ev.type === "turn.completed") {
@@ -1023,7 +1071,9 @@ async function streamCodex(repo, prompt, body, emit, aborted) {
       if (buf.trim()) { try { handle(JSON.parse(buf)); } catch { /* partial */ } }
       if (aborted()) return done(hadError);            // client gone — match the claude path (no trailing emits)
       if (!started) { hadError = true; emit("error", { message: stderr.trim().slice(0, 500) || "codex did not start" }); }
-      emit("result", { isError: hadError, result: lastText || null });
+      // §6: `result.result` is only a fallback for text that never streamed. Every agent_message
+      // already went out as a `delta`, so repeating the last one here showed it twice in the panel.
+      emit("result", { isError: hadError, result: null });
       done(hadError);
     };
     child.on("error", (e) => { if (!started) emit("error", { message: `codex error: ${e?.message || e}` }); hadError = true; finish(); });
@@ -1035,13 +1085,13 @@ async function streamCodex(repo, prompt, body, emit, aborted) {
 // `--include-partial-messages` (Claude-like Messages wire shape; frozen against grok 1.0.3 — see
 // shim/fixtures/grok-streaming-messages-edit.jsonl). Large prompts go through `--prompt-file` (never
 // argv `-p`). PREAMBLE is prepended into that file. Auth is host-only: `grok login` / XAI_API_KEY env.
-async function streamGrok(repo, prompt, body, emit, aborted) {
+async function streamGrok(repo, prompt, body, emit, aborted, mode = "design") {
   const model = requestedModel(body), effort = selectedEffort(body);
   let absRepo;
   try { absRepo = await realpath(repo); }
   catch (e) { emit("error", { message: `could not resolve repo path: ${e?.message || e}` }); return true; }
   const promptFile = join(os.tmpdir(), `slidewrite-grok-prompt-${Date.now()}-${randomBytes(4).toString("hex")}.txt`);
-  try { await writeFile(promptFile, PREAMBLE + "\n\n" + prompt, "utf8"); }
+  try { await writeFile(promptFile, preambleFor(mode) + "\n\n" + prompt, "utf8"); }
   catch (e) { emit("error", { message: `could not write grok prompt file: ${e?.message || e}` }); return true; }
   const args = [
     "--prompt-file", promptFile,
@@ -1056,6 +1106,7 @@ async function streamGrok(repo, prompt, body, emit, aborted) {
   ];
   if (model) args.push("-m", model);
   if (effort) args.push("--effort", effort);
+  if (mode !== "design") args.push("--tools", GROK_READ_ONLY_TOOLS.join(","));  // Ask/Plan: only read tools exist
   if (validSessionId(body.resume)) args.push("-r", body.resume);
   const env = { ...process.env };
   if (GROK_HOME) env.GROK_HOME = GROK_HOME;
@@ -1167,12 +1218,13 @@ async function streamGrok(repo, prompt, body, emit, aborted) {
 }
 
 // Provider dispatch for the agent step. Explicit allow-list — unknown providers hard-error (no
-// silent Claude fallthrough). Shared by runDesign and runImage.
-function runAgent(repo, prompt, body, emit, aborted) {
+// silent Claude fallthrough). Shared by runDesign and runImage. `mode` ("design" | "ask" | "plan")
+// picks the preamble and, for ask/plan, the provider's read-only tool restriction.
+function runAgent(repo, prompt, body, emit, aborted, mode = "design") {
   const provider = body.provider || "anthropic";
-  if (provider === "anthropic") return streamQuery(repo, prompt, body, emit, aborted);
-  if (provider === "openai") return streamCodex(repo, prompt, body, emit, aborted);
-  if (provider === "grok") return streamGrok(repo, prompt, body, emit, aborted);
+  if (provider === "anthropic") return streamQuery(repo, prompt, body, emit, aborted, mode);
+  if (provider === "openai") return streamCodex(repo, prompt, body, emit, aborted, mode);
+  if (provider === "grok") return streamGrok(repo, prompt, body, emit, aborted, mode);
   if (provider === "google") { emit("error", { message: "Google provider is not yet supported" }); return Promise.resolve(true); }
   emit("error", { message: `Unknown provider "${provider}" — upgrade the shim or pick anthropic/openai/grok in options` });
   return Promise.resolve(true);
@@ -1204,19 +1256,143 @@ async function saveScreenshot(element, n = 0) {
   return tmpPath;
 }
 
+// --- Plan files (mode "plan") ----------------------------------------------------------------
+// The agent only PROPOSES a path (its reply's first line, `PLAN_PATH: …`); the shim validates it and
+// writes the file itself, so a Plan run's sole write is one NEW .md inside the repo. Default when the
+// target repo's CLAUDE.md / AGENTS.md don't say where plans go: the first existing dir below, else
+// the repo root.
+const PLAN_DIRS = ["docs/plans", "spec/plans", "specs/plans", "docs"];
+const pad2 = (n) => String(n).padStart(2, "0");
+async function defaultPlanPath(repo, prompt) {
+  let dir = "";
+  for (const d of PLAN_DIRS) {
+    try { if ((await stat(join(repo, d))).isDirectory()) { dir = `${d}/`; break; } } catch { /* absent */ }
+  }
+  const now = new Date();
+  const slug = String(prompt || "").split("\n")[0].toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .slice(0, 48).replace(/^-+|-+$/g, "") || "plan";
+  return `${dir}${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}-${slug}.md`;
+}
+
+// A proposed plan path is accepted only if it's repo-relative, plain ASCII (letters, digits, `._-`),
+// ends in .md, isn't under node_modules, and no segment starts with a dot — which rules out `..`,
+// absolute paths, and .git / .claude / .env. Returns the normalized path or null.
+const PLAN_PATH_RE = /^(?:[A-Za-z0-9_][A-Za-z0-9._-]*\/)*[A-Za-z0-9_][A-Za-z0-9._-]*\.md$/i;
+function cleanPlanPath(p) {
+  const s = String(p || "").trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  return PLAN_PATH_RE.test(s) && !s.split("/").includes("node_modules") ? s : null;
+}
+
+// True when `rel` stays inside the repo even through symlinks: realpath the target's nearest
+// existing ancestor and require it under realpath(repo).
+async function insideRepo(repo, rel) {
+  const root = await realpath(repo);
+  let dir = dirname(join(root, rel));
+  for (;;) {
+    try { const r = await realpath(dir); return r === root || r.startsWith(root + sep); }
+    catch { const up = dirname(dir); if (up === dir) return false; dir = up; }
+  }
+}
+
+// Split the agent's final reply into the proposed path and the plan body. Tolerates the path line
+// wrapped in emphasis/backticks and a fenced plan; with no path line, chatter before the first
+// `# ` heading is dropped.
+function extractPlan(text) {
+  let t = String(text || "").replace(/\r\n/g, "\n"), path = null;
+  const m = /^[ \t>*_`]*PLAN_PATH:[ \t*_`]*([^\s`*]+)[ \t*_`]*$/m.exec(t);
+  if (m) { path = m[1]; t = t.slice(m.index + m[0].length); }
+  else { const h = /^# /m.exec(t); if (h) t = t.slice(h.index); }
+  t = t.trim();
+  const fence = /^```[\w-]*\n([\s\S]*?)\n```$/.exec(t);
+  return { path, body: (fence ? fence[1] : t).trim() };
+}
+
+// Write the plan as a NEW file at the first acceptable of: the agent's path, the default, the
+// default's filename at the repo root. Never overwrites — a taken name gets -2, -3, … Returns the
+// repo-relative path written.
+async function savePlan(repo, proposed, fallback, text) {
+  let rel = null;
+  for (const c of [cleanPlanPath(proposed), fallback, basename(fallback)])
+    if (c && await insideRepo(repo, c)) { rel = c; break; }
+  if (!rel) throw new Error("no writable location inside the repo");
+  await mkdir(join(repo, dirname(rel)), { recursive: true });
+  for (let n = 1; n < 100; n++) {
+    const candidate = n === 1 ? rel : `${rel.slice(0, -3)}-${n}.md`;
+    try { await writeFile(join(repo, candidate), text + "\n", { flag: "wx" }); return candidate; }
+    catch (e) { if (e?.code !== "EEXIST") throw e; }
+  }
+  throw new Error(`${rel} and its numbered variants already exist`);
+}
+
+// Tap an emit to recover the agent's FINAL reply, provider-agnostically: the text streamed since the
+// last tool call, unless the `result` event carries it (codex always does; claude/grok only when
+// nothing streamed).
+function finalTextTap(emit) {
+  let since = "", final = null;
+  const tap = (type, data = {}) => {
+    if (type === "delta") since += data.text || "";
+    else if (type === "tool" || type === "file_edit") since = "";
+    else if (type === "result" && data.result) final = data.result;
+    emit(type, data);
+  };
+  return { emit: tap, text: () => final || since };
+}
+
 // Core: drive one design run. `emit(type, data)` sends an SSE event; `aborted()` lets the caller
 // cancel (client disconnect). Exported so the HTTP handler and tests share one implementation.
 // `repo` defaults to the single-repo REPO; the HTTP layer passes the Host-resolved repo.
+// `body.mode` "ask" / "plan" makes it a read-only run (see ASK_PREAMBLE / PLAN_PREAMBLE).
 export async function runDesign(body, emit, aborted = () => false, _signal, repo = REPO) {
+  const mode = runMode(body);
+  // An unknown mode is refused, never run as an edit: a newer client may mean something read-only.
+  if (!MODES.includes(mode)) { emit("error", { message: `Unknown mode "${mode}" — upgrade the shim` }); return emit("done"); }
   const dirty0 = new Set(await porcelainPaths(repo));
   const elements = elementsOf(body);
   const shotPaths = await Promise.all(elements.map((el, i) => saveScreenshot(el, i)));
-  const hadError = await runAgent(repo, buildPrompt(body, elements, shotPaths), body, emit, aborted);
+  // Ask: every provider's request leads with `QUESTION ONLY: ` (after the preamble, before the text).
+  let prompt = (mode === "ask" ? "QUESTION ONLY: " : "") + buildPrompt(body, elements, shotPaths);
+  const planDefault = mode === "plan" ? await defaultPlanPath(repo, body.prompt) : null;
+  if (planDefault)
+    prompt += `\n\n[Plan file: unless CLAUDE.md / AGENTS.md say plans or docs belong elsewhere, use PLAN_PATH: ${planDefault}]`;
+  const tap = mode === "plan" ? finalTextTap(emit) : null;
+  const hadError = await runAgent(repo, prompt, body, tap ? tap.emit : emit, aborted, mode);
   if (aborted()) return;
-  // `autoCommit: false` (extension per-origin option) leaves the edits uncommitted in the working
-  // tree; absent/anything-else keeps the original auto-commit behavior.
-  if (!hadError && body.autoCommit !== false)
-    await commitChanged(repo, dirty0, (body.prompt || "design change").split("\n")[0].slice(0, 72), emit);
+  if (mode === "design") {
+    // `autoCommit: false` (extension per-origin option) leaves the edits uncommitted in the working
+    // tree; absent/anything-else keeps the original auto-commit behavior.
+    if (!hadError && body.autoCommit !== false)
+      await commitChanged(repo, dirty0, (body.prompt || "design change").split("\n")[0].slice(0, 72), emit);
+    return emit("done");
+  }
+  // Ask / Plan never commit the agent's own edits (claude/grok can't make any; codex is only told not
+  // to). Diff the tree as a backstop and report anything that changed — left untouched.
+  const dirty1 = await porcelainPaths(repo);
+  let stray = dirty1.filter((p) => !dirty0.has(p));
+  const { path, body: plan } = mode === "plan" ? extractPlan(tap.text()) : {};
+  // A Plan agent with write access (codex) may save the plan itself at the PLAN_PATH it names — adopt
+  // that file rather than writing a duplicate `-2` beside it and flagging it as stray.
+  const adopted = mode === "plan" && stray.includes(cleanPlanPath(path)) ? cleanPlanPath(path) : null;
+  if (adopted) stray = stray.filter((p) => p !== adopted);
+  if (stray.length)
+    emit("error", { message: `The working tree changed during this ${mode === "ask" ? "Ask" : "Plan"} run ` +
+      `(left uncommitted): ${stray.slice(0, 10).join(", ")}${stray.length > 10 ? ", …" : ""}` });
+  const planSubj = () => `plan — ${(body.prompt || "plan").split("\n")[0].slice(0, 72)}`;
+  if (adopted) {
+    emit("plan_saved", { path: adopted });
+    if (!hadError && body.autoCommit !== false)
+      await commitChanged(repo, new Set(dirty1.filter((p) => p !== adopted)), planSubj(), emit);
+  } else if (mode === "plan") {
+    if (hadError || !plan)
+      emit("error", { message: `plan not saved — ${hadError ? "the run ended with an error" : "the agent returned no plan text"}` });
+    else {
+      try {
+        const rel = await savePlan(repo, path, planDefault, plan);
+        emit("plan_saved", { path: rel });
+        // Commit only the plan file: anything already dirty after the run (dirty1) is excluded.
+        if (body.autoCommit !== false) await commitChanged(repo, new Set(dirty1), planSubj(), emit);
+      } catch (e) { emit("error", { message: `plan not saved — ${e?.message || e}` }); }
+    }
+  }
   emit("done");
 }
 
@@ -1293,6 +1469,7 @@ function serve() {
       return json(res, 200, {
         project: basename(repo), repoDir: repo, version: VERSION,
         branch, dirty: !!status,
+        modes: MODES,  // `/design` run modes this shim honors; the panel only offers Ask/Plan when listed
         ...modelMeta,  // legacy top-level models/defaultModel = discovered Anthropic list (back-compat)
         geminiModel: GEMINI_MODEL, geminiEnv: !!GEMINI_KEY,  // geminiEnv: shim has a server-side key fallback
       });

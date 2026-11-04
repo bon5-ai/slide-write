@@ -166,6 +166,24 @@ function providerAllowed(meta, provider) {
   return !!(p && p.enabled);
 }
 
+// The "+" menu's per-message modes — mutually exclusive, reset after each send. `image` routes to
+// /generate-image; `ask` / `plan` ride /design as its read-only `mode` (README §6 "Ask & Plan modes").
+const COMPOSE_MODES = [
+  { id: "image", icon: "🖼️", label: "Image Generation", desc: "Generate an image into the picked element",
+    placeholder: "Describe the image to generate…" },
+  { id: "ask", icon: "💬", label: "Ask", desc: "Answer a question — changes nothing",
+    placeholder: "Ask a question — read-only, no code or files change…" },
+  { id: "plan", icon: "📋", label: "Plan", desc: "Write a markdown plan into the repo's docs",
+    placeholder: "Describe what to plan — saved as a markdown file, no code changes…" },
+];
+const modeInfo = (id) => COMPOSE_MODES.find((m) => m.id === id) || null;
+// Ask/Plan need a shim whose /meta lists them in `modes` — an older shim ignores `mode` and would
+// run an Ask as an ordinary edit. Image (its own route) and the default design run predate `modes`.
+function modeSupported(meta, id) {
+  if (!id || id === "image") return true;
+  return !!(meta && Array.isArray(meta.modes) && meta.modes.includes(id));
+}
+
 export function createPanel({ root, shimUrl, token, meta, conn, provider, model, effort, screen, origin, onMarkup, onOpenOptions, onProbe, onSelectModel, onSelectEffort, onReload, autoReload, autoCommit, configured, geminiKey, pollInterval, imageInstructions }) {
   // Live config — reassignable via api.setConfig so enabling the origin in Options flips the panel
   // from its disabled "set up" state to live, with no reload. `screen` is the active tab's route
@@ -197,7 +215,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   let runLabel = "", runModel = "", runTokens = null, runTokensEst = 0;
   const MAX_ELEMENTS = 5;           // stacked-picks cap, so the prompt/context window stays sane
   let elementCtxs = [];             // §7 element contexts (the picker appends; ≤ MAX_ELEMENTS)
-  let imageMode = false;            // when true, the next send generates an image into the picked element(s)
+  let composeMode = null;           // "+" menu mode for the next send: null | "image" | "ask" | "plan"
   let queue = [];                   // follow-up intents typed while a run is in flight; drained at run end
   let resumeId = null;              // when set, each send continues this past session
   let liveResumeId = null;          // live chat's session, stashed while a history detail owns resumeId
@@ -320,10 +338,10 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   const sendLabel = el("span", { class: "dmsg-sendlabel", text: "Send" });
   const sendBtn = el("button", { class: "dmsg-send", title: "Send (Enter)", onclick: () => send() }, [sendIcon, sendLabel]);
 
-  // "+" composer menu — toggles per-message modes (currently Image Generation). Opens upward like
-  // the model menu. The Image Generation item is a checkbox-style toggle: when on, the next send
-  // routes to /generate-image and places the result onto the selected element (img src or div
-  // background, per the element type — the shim decides).
+  // "+" composer menu — picks the next send's mode (Image Generation / Ask / Plan; at most one).
+  // Opens upward like the model menu. Image routes to /generate-image and places the result onto the
+  // selected element (img src or div background — the shim decides); Ask answers read-only; Plan
+  // saves a markdown plan file. Picking the active mode again turns it off.
   const plusBtn = el("button", { class: "dmsg-plus", title: "Add to message", text: "＋" });
   plusBtn.addEventListener("click", (e) => { e.stopPropagation(); togglePlusMenu(); });
   const plusMenu = el("div", { class: "dmsg-plusmenu", hidden: "" });
@@ -424,16 +442,25 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     applyConfigured();
   }
 
-  // Render the "+" menu items, reflecting current toggle state (Image Generation = imageMode).
+  // Render the "+" menu items, reflecting the current mode. Ask/Plan are disabled (with the reason)
+  // when the connected shim doesn't advertise them.
   function renderPlusMenu() {
     plusMenu.textContent = "";
-    plusMenu.append(el("button", {
-      class: `dmsg-menuitem${imageMode ? " dmsg-menuitem-active" : ""}`,
-      onclick: (e) => { e.stopPropagation(); setImageMode(!imageMode); togglePlusMenu(false); },
-    }, [
-      el("span", { class: "dmsg-menuitem-label", text: "🖼️  Image Generation" }),
-      imageMode ? el("span", { class: "dmsg-menuitem-check", text: "✓" }) : null,
-    ]));
+    for (const m of COMPOSE_MODES) {
+      const on = composeMode === m.id, ok = modeSupported(cfg.meta, m.id);
+      plusMenu.append(el("button", {
+        class: `dmsg-menuitem${on ? " dmsg-menuitem-active" : ""}`,
+        title: ok ? m.desc : `${m.label} needs a newer slide-write shim — restart it from the latest code`,
+        disabled: ok ? null : "",
+        onclick: (e) => { e.stopPropagation(); setMode(on ? null : m.id); togglePlusMenu(false); },
+      }, [
+        el("span", { class: "dmsg-menuitem-text" }, [
+          el("span", { class: "dmsg-menuitem-label", text: `${m.icon}  ${m.label}` }),
+          el("span", { class: "dmsg-menuitem-desc", text: ok ? m.desc : "Needs a newer shim" }),
+        ]),
+        on ? el("span", { class: "dmsg-menuitem-check", text: "✓" }) : null,
+      ]));
+    }
   }
   function togglePlusMenu(force) {
     const open = force != null ? force : plusMenu.hidden;
@@ -441,17 +468,22 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     plusMenu.hidden = !open;
     plusBtn.classList.toggle("dmsg-plus-open", open);
   }
-  // Flip image mode on/off and reflect it in the composer (placeholder, element chip icons, the
-  // "+" button's active styling). Sticky until toggled off or reset after a send.
-  function setImageMode(on) {
-    imageMode = !!on;
-    plusBtn.classList.toggle("dmsg-plus-active", imageMode);
+  // Switch the send mode (null clears it) and reflect it in the composer: placeholder, element chip
+  // icons, and the "+" button, which shows the active mode's icon with amber styling. Sticky until
+  // changed or reset after a send.
+  function setMode(id) {
+    const info = modeInfo(id);
+    composeMode = info ? info.id : null;
+    plusBtn.textContent = info ? info.icon : "＋";
+    plusBtn.title = info ? `${info.label} mode — click to change` : "Add to message";
+    plusBtn.classList.toggle("dmsg-plus-active", !!info);
     renderPlaceholder();
     if (elementCtxs.length) renderChips();
     renderPlusMenu();
   }
   function renderPlaceholder() {
-    textarea.placeholder = imageMode ? "Describe the image to generate…"
+    const info = modeInfo(composeMode);
+    textarea.placeholder = info ? info.placeholder
       : inHistoryDetail ? "Continue this conversation…"
       : "Describe what you want to create…";
   }
@@ -721,6 +753,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
         renderRunStatus();
         break;
       case "image_generated": toolRow("🖼️ image generated", ev.mimeType || ""); break;
+      case "plan_saved": addRow(el("div", { class: "dmsg-row dmsg-plan", text: `📋 Plan saved → ${ev.path}` })); break;
       case "user":    appendDelta("user", ev.text); break;
       case "delta":   if (busy) setPhase("responding"); appendDelta("assistant", ev.text); estTokens(ev.text); break;
       case "thinking_delta": if (busy) setPhase("thinking"); appendDelta("thinking", ev.text); estTokens(ev.text); break;
@@ -853,6 +886,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       setStatus(`shim does not support provider “${cfg.provider}” — upgrade slide-write`);
       return;
     }
+    if (modeBlocked()) return;
     if (busy) {
       const intent = readComposer();
       if (intent) { enqueue(intent); updateSendBtn(); }
@@ -863,13 +897,21 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     if (intent) dispatch(intent);
   }
 
-  // Snapshot the composer into a send intent and reset it for the next message. The element/image
+  // An Ask/Plan the connected shim doesn't advertise would run as an ordinary edit there — refuse to
+  // send it (an empty box still falls through, so Cancel keeps working mid-run).
+  function modeBlocked() {
+    if (modeSupported(cfg.meta, composeMode) || !textarea.value.trim()) return false;
+    setStatus(`${modeInfo(composeMode).label} needs a newer slide-write shim — restart it from the latest code`);
+    return true;
+  }
+
+  // Snapshot the composer into a send intent and reset it for the next message. The element/mode
   // state is captured here (before clearElementContext resets it) so a queued follow-up carries the
   // context the user had when they typed it. Returns null when the box is empty.
   function readComposer() {
     const prompt = textarea.value.trim();
     if (!prompt) return null;
-    const intent = { prompt, image: imageMode, elements: elementCtxs.slice(), model: selectedModel, effort: selectedEffort };
+    const intent = { prompt, mode: composeMode, elements: elementCtxs.slice(), model: selectedModel, effort: selectedEffort };
     textarea.value = "";
     clearElementContext();
     return intent;
@@ -878,9 +920,20 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // Run one intent: build the §7 payload (resolving resumeId LIVE so a queued follow-up threads into
   // whatever session the prior run settled on), stream it, then drain the next queued intent.
   function dispatch(intent) {
-    const { prompt, image, elements, model, effort } = intent;
+    const { prompt, mode, elements, model, effort } = intent;
+    const info = modeInfo(mode);
+    addRow(el("div", { class: "dmsg-bubble dmsg-user" }, [
+      info ? el("div", { class: "dmsg-bubblemode", text: `${info.icon} ${info.label}` }) : null,
+      el("div", { class: "dmsg-bubbletext", text: prompt }),
+    ]));
+    // Re-checked for queued sends: /meta may have changed (e.g. an older shim restarted) since.
+    if (!modeSupported(cfg.meta, mode)) {
+      onEvent({ type: "error", message: `not sent — ${info.label} needs a newer slide-write shim` });
+      drainQueue();
+      return;
+    }
     let payload, path;
-    if (image) {
+    if (mode === "image") {
       payload = { imagePrompt: prompt, screen: cfg.screen || "", model, effort, provider: cfg.provider,
         geminiKey: cfg.geminiKey, imageInstructions: cfg.imageInstructions, autoCommit: cfg.autoCommit };
       // Strip the element screenshots — /generate-image uses imageDataUrl (the canvas-read source
@@ -890,6 +943,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       path = "/generate-image";
     } else {
       payload = { prompt, screen: cfg.screen || "", model, effort, provider: cfg.provider, autoCommit: cfg.autoCommit };
+      // Ask/Plan: a read-only run on the same route (so it threads into the same session via resume).
+      if (mode === "ask" || mode === "plan") payload.mode = mode;
       // Drop imageDataUrl (only meaningful to /generate-image) and the UI-only screenshot dimensions,
       // but KEEP screenshotDataUrl — the shim writes each to a temp file for claude to Read.
       if (elements.length)
@@ -897,7 +952,6 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       if (resumeId) payload.resume = resumeId;
       path = "/design";
     }
-    addRow(el("div", { class: "dmsg-bubble dmsg-user" }, [el("div", { class: "dmsg-bubbletext", text: prompt })]));
     setBusy(true);
     controller = new AbortController();
     return streamDesign(cfg.shimUrl, cfg.token, payload, onEvent, controller.signal, path)
@@ -909,12 +963,15 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       .finally(() => {
         setBusy(false);
         controller = null;
-        // Drain the next queued follow-up (an explicit cancel already emptied the queue).
-        if (queue.length) { const next = queue.shift(); renderQueue(); dispatch(next); }
+        drainQueue();
       });
   }
 
   // --- Queued follow-ups ---------------------------------------------------------------------
+  // Dispatch the next queued follow-up, if any (an explicit cancel already emptied the queue).
+  function drainQueue() {
+    if (queue.length) { const next = queue.shift(); renderQueue(); dispatch(next); }
+  }
   function enqueue(intent) {
     queue.push(intent);
     renderQueue();
@@ -923,7 +980,8 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   function renderQueue() {
     queuedList.textContent = "";
     queue.forEach((it, i) => {
-      const label = `${it.image ? "🖼️ " : ""}${it.prompt}`;
+      const info = modeInfo(it.mode);
+      const label = `${info ? `${info.icon} ` : ""}${it.prompt}`;
       queuedList.append(el("div", { class: "dmsg-queueitem" }, [
         el("span", { class: "dmsg-queueitem-badge", text: `⏳ ${i + 1}` }),
         el("span", { class: "dmsg-queueitem-text", text: label, title: label }),
@@ -946,7 +1004,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // (🖼️ when image generation is on, else 🎯).
   function renderChips() {
     ctxChips.textContent = "";
-    const icon = imageMode ? "🖼️" : "🎯";
+    const icon = composeMode === "image" ? "🖼️" : "🎯";
     elementCtxs.forEach((ctx, i) => {
       // Pasted images have no DOM — render a single thumbnail chip (no identity chip), whose ✕
       // removes the whole entry (clearScreenshot would strand an invisible entry that still counts
@@ -974,7 +1032,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   }
   function removeElement(i) {
     elementCtxs.splice(i, 1);
-    if (!elementCtxs.length) setImageMode(false);
+    if (!elementCtxs.length && composeMode === "image") setMode(null);
     renderChips();
   }
   function clearScreenshot(i) {
@@ -997,7 +1055,7 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   }
   function clearElementContext() {
     elementCtxs = [];
-    setImageMode(false);
+    setMode(null);
     renderChips();
   }
 

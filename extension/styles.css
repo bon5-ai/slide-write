@@ -126,6 +126,9 @@ body { background: #14141b; color: #e6e6ef; }
 /* Persistent stats line in the composer (below the chips) — single line, ellipsized. */
 .dmsg-livestats { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dmsg-commit { color: #7ee07e; font-weight: 600; }
+.dmsg-plan { color: #8fc3ff; font-weight: 600; }
+/* Mode tag ("💬 Ask", "📋 Plan", "🖼️ Image Generation") atop a user bubble sent in that mode. */
+.dmsg-bubblemode { font-size: 11px; font-weight: 600; opacity: .8; margin-bottom: 3px; }
 .dmsg-error { color: #ff8a8a; }
 .dmsg-note { color: #7a7a90; font-style: italic; }
 
@@ -161,8 +164,9 @@ body { background: #14141b; color: #e6e6ef; }
 .dmsg-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; }
 .dmsg-toolbar-left { display: flex; align-items: center; gap: 4px; min-width: 0; }
 
-/* "+" composer menu — round icon button whose menu opens upward, holding per-message toggles
-   (Image Generation). Goes amber-tinted while a toggle is active so the mode is visible at a glance. */
+/* "+" composer menu — round icon button whose menu opens upward, holding the per-message modes
+   (Image Generation / Ask / Plan). While a mode is active the button shows that mode's icon,
+   amber-tinted, so the mode is visible at a glance. */
 .dmsg-pluswrap { position: relative; flex-shrink: 0; }
 .dmsg-plus {
   display: inline-flex; align-items: center; justify-content: center;
@@ -175,7 +179,7 @@ body { background: #14141b; color: #e6e6ef; }
   background: #3a2a22; border-color: #cc7a5b; color: #e8a585;
 }
 .dmsg-plusmenu {
-  position: absolute; bottom: calc(100% + 6px); left: 0; min-width: 200px; z-index: 5;
+  position: absolute; bottom: calc(100% + 6px); left: 0; min-width: 240px; z-index: 5;
   background: #1f1f2b; border: 1px solid #34344a; border-radius: 10px; padding: 4px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, .5);
 }
@@ -185,8 +189,12 @@ body { background: #14141b; color: #e6e6ef; }
   font-size: 12px; font-family: inherit; padding: 7px 9px; border-radius: 7px;
 }
 .dmsg-menuitem:hover { background: #2c2c3a; }
+.dmsg-menuitem:disabled { opacity: .5; cursor: default; }
+.dmsg-menuitem:disabled:hover { background: transparent; }
 .dmsg-menuitem-active { color: #fff; }
 .dmsg-menuitem-check { color: #cc7a5b; }
+.dmsg-menuitem-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dmsg-menuitem-desc { font-size: 11px; color: #8a8aa0; }
 
 /* Model selector — a text button + chevron whose menu opens upward (composer sits at the bottom). */
 .dmsg-modelwrap { position: relative; min-width: 0; }

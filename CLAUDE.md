@@ -27,7 +27,12 @@ checkbox routes the 🎯 button through the Chrome DevTools Protocol in `backgro
 module importing `content/capture.js` — instead of the content-script picker; needs the `debugger`
 permission, declared **required** in the manifest because Chrome forbids `debugger` as optional, so it
 ships always-granted with the broader install warning; it reaches cross-origin iframes, and both
-backends emit the identical §7 contract so nothing downstream changes). README.md remains the
+backends emit the identical §7 contract so nothing downstream changes), and **Ask / Plan modes**
+(README §6 "Ask & Plan modes": the composer's "+" menu holds Image Generation / Ask / Plan as one
+per-send mode; Ask/Plan POST `/design` with a top-level `mode`, advertised in `/meta.modes`, and run
+read-only — tool-enforced for Anthropic/Grok, prompt-only for OpenAI — Ask just answers; Plan's final
+reply starts `PLAN_PATH: …` and the shim writes that one new `.md` file itself, emitting
+`plan_saved`). README.md remains the
 authoritative spec — it inlines every
 contract and the load-bearing code verbatim (§5 shim, §8.2 SSE reader); treat those as authoritative
 and extend them in lockstep. The mechanical parts (UI rendering, helpers) may be implemented freely
@@ -76,6 +81,21 @@ the dev server hot-reloads.
 - **The extension requires `<all_urls>` host permission** — load-bearing for the element-screenshot
   crop: `chrome.tabs.captureVisibleTab` needs `<all_urls>` or a per-tab `activeTab` gesture, and the
   side panel never gets `activeTab`. Don't narrow it back to localhost-only or screenshots break.
+- **Ask/Plan stay read-only at the tool layer for Anthropic and Grok.** Anthropic gets the
+  `READ_ONLY_TOOLS` allowlist + edit tools and `Bash` disallowed + no MCP (`--tools`/
+  `--disallowedTools`/`--strict-mcp-config` in the Python shim); grok gets
+  `--tools read_file,grep,list_dir,web_fetch`. **OpenAI is the deliberate exception** (owner's call):
+  codex runs exactly as for design (no `-s read-only` — its bubblewrap sandbox can't start on hosts
+  that restrict unprivileged user namespaces, and then codex can't even read), guided by the mode
+  preamble alone. Every provider's Ask request is prefixed `QUESTION ONLY: ` (in `runDesign`/
+  `run_design`, not per driver). Ask never commits, for any provider (the
+  porcelain backstop reports stray changes, uncommitted); Plan commits only the plan file — the one the
+  **shim** wrote after validating the agent's `PLAN_PATH` (repo-relative, `.md`, no dot segments,
+  inside the repo through symlinks, never overwriting), or, when codex wrote it there itself, that
+  adopted file. Unknown `mode` values are refused, not run as edits, and the extension only sends
+  Ask/Plan when `/meta.modes` lists them (an old shim would ignore `mode` and edit).
+- **`result.result` is a fallback only** (§6): drivers and history mappers that already streamed the
+  final text as `delta`s must send `result: null`, or the panel shows the answer twice.
 - **Reuse the host's `claude` login** via the Agent SDK — no `ANTHROPIC_API_KEY`. Credential
   portability across Win/macOS/Linux is the `claude` CLI's job, not the shim's.
 - **Project knowledge lives in the TARGET repo's CLAUDE.md** (loaded via `settingSources:

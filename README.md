@@ -60,6 +60,11 @@ the extension spec. It's written to be implemented by **Claude Code** — see [�
   message), each shown as its own removable chip; 🎯 again or Esc finishes picking.
 - The panel streams **thinking, tool calls, file edits, tool output, a final summary, and run
   stats** live over SSE, and shows the commit each run makes.
+- **Ask and Plan modes** (the composer's "+" menu, next to Image Generation): **Ask** answers a
+  question about the code without changing anything; **Plan** writes an implementation plan as a
+  markdown file wherever the repo's CLAUDE.md / AGENTS.md say docs belong (else `docs/` or
+  `spec/plans/`, else the repo root). With Anthropic and Grok both are read-only at the tool level
+  (the agent gets no write tools); OpenAI (codex) runs normally and is told to stay read-only.
 - **Reusable across projects.** The shim is generic; per-project knowledge comes from the target
   repo's own `CLAUDE.md`. Adding it to a project is: run the shim pointed at the repo, enable the
   origin in the extension. **No edits to the project's source.**
@@ -237,6 +242,15 @@ Rendered, the system prompt reads:
 The verbatim source string lives at `PREAMBLE` in `shim/slide-write.mjs` (and the Python port in
 `shim/slide-write.py`); keep this prose in sync with both if you edit it.
 
+**Ask** and **Plan** runs ([§6](#6-the-sse-event-contract) "Ask & Plan modes") replace
+PREAMBLE with `ASK_PREAMBLE` / `PLAN_PREAMBLE` (same files, same project-agnostic spirit). Ask: *this
+is a READ-ONLY request — investigate, answer concisely with `path:line` citations, describe rather
+than make any change*. Plan: *don't implement or change files — write an implementation plan (goal,
+files and their changes, ordered steps, risks / open questions, verification) as the final reply,
+whose first line is `PLAN_PATH: <repo-relative .md path>` chosen from where the repo's CLAUDE.md /
+AGENTS.md say plans or docs belong, else the default the request names*. For Anthropic (and Grok,
+§5.4) the prompt is not the only guard; see the run loop below.
+
 The other load-bearing bit is **how the clicked elements become prompt context.** A request may
 carry up to **5** stacked targets ([§7](#7-the-element-capture-contract) `elements`; the
 `elementsOf()` helper normalizes — legacy single `element` accepted — and re-caps server-side).
@@ -275,7 +289,12 @@ Everything else is mechanical and may be implemented freely as long as it honors
   `--debug`/`SW_DEBUG` logs each `m.type`/`m.subtype` to stderr. Bail immediately when `aborted()`
   (client disconnect) returns true. `--use-skills`/`SLIDEWRITE_USE_SKILLS` adds `skills: "all"` so the
   target repo's `.claude/skills/` are loaded (off by default — `settingSources:["project"]` alone does
-  not enable skills).
+  not enable skills). **Ask / Plan runs** keep that loop but add `tools: ["Read", "Grep", "Glob",
+  "WebFetch", "WebSearch"]` (plus `"Skill"` with `--use-skills`) — the SDK's base built-in tool set,
+  so nothing else exists for the run — `disallowedTools: ["Edit", "Write", "MultiEdit",
+  "NotebookEdit", "Bash"]` as a second gate, and `strictMcpConfig: true` (no MCP servers), with
+  `systemPrompt: ASK_PREAMBLE | PLAN_PREAMBLE`. Validated on SDK 0.3.168: told to create and edit
+  files, the agent reported exactly those five tools and the tree stayed clean.
 - **Auto-commit only what this run changed.** Snapshot `git status --porcelain -uall` before the
   run, diff after, `git add` + commit just the new paths under a `Slide Write` identity (no push),
   emit `commit`. **Parse porcelain untrimmed** (`line.slice(3)`) — the leading status-column space
@@ -314,6 +333,10 @@ Differences from the Node shim (all invisible to the client):
 - **Skills parity is inverted at the CLI:** the CLI loads skills by *default* (the SDK doesn't), so
   without `--use-skills` the shim passes `--disable-slash-commands` to match the Node shim's
   no-skills default.
+- **Ask / Plan read-only runs** map the SDK's `tools` / `disallowedTools` / `strictMcpConfig` onto
+  `--tools Read,Grep,Glob,WebFetch,WebSearch` (plus `Skill` with `--use-skills`),
+  `--disallowedTools Edit,Write,MultiEdit,NotebookEdit,Bash` and `--strict-mcp-config` (validated
+  against `claude` CLI 2.1.312: the agent reports exactly those five tools).
 - **SSE framing is close-delimited** (`Connection: close`; `BaseHTTPRequestHandler` doesn't chunk)
   rather than Node's chunked encoding — the §8.2 fetch-reader handles both identically.
 - **Client disconnect** is detected by a failed SSE write or a socket EOF peek between stream
@@ -339,10 +362,14 @@ event stream is mapped by `streamCodex` / `stream_codex`:
 
 - `thread.started` → `start` (its `thread_id` is the session id, used for resume)
 - `item.completed` with `file_change` → `file_edit` (one per changed path) · `agent_message` →
-  `delta` · `reasoning` → `thinking_delta` · `command_execution` → `tool`
+  `delta` · `reasoning` → `thinking_delta` · `command_execution` → `tool`. codex messages arrive
+  whole, so an `agent_message` that follows another with no tool row between them gets a leading
+  `\n\n` — otherwise they run together in one bubble.
 - `turn.completed.usage` → the cumulative `usage` event (`input_tokens`, `cached_input_tokens` →
   `cacheReadTokens`, `reasoning_output_tokens` → `thinkingTokens`)
-- `error` / `turn.failed` → marks the run errored; stream end emits `result`.
+- `error` / `turn.failed` → marks the run errored; stream end emits `result` with **`result: null`**
+  — every agent message already streamed as a `delta`, and per §6 `result.result` is only a fallback
+  for text that never streamed (repeating the last message there made the panel show it twice).
 
 **Auth reuses codex's own login — no API key here.** codex reads `CODEX_HOME/auth.json` (default
 `~/.codex`), the same ChatGPT-oauth credentials the `codex` CLI logs in with. The shim never handles
@@ -353,6 +380,17 @@ Extra flags (both shims): **`--codex-bin <path>`/`SLIDEWRITE_CODEX_BIN`** (defau
 against `codex` CLI 0.144.1; `codex exec --json` is the headless equivalent of
 `claude -p --output-format stream-json`. Resume threads a prior codex session via
 `codex exec … resume <thread_id> -` (the `-` reads the continuation prompt from stdin).
+
+**Ask / Plan runs** ([§6](#6-the-sse-event-contract) "Ask & Plan modes") use the **same codex
+invocation as a design run** (`--dangerously-bypass-approvals-and-sandbox`) — read-only is by prompt
+here, not enforced: stdin gets `ASK_PREAMBLE` / `PLAN_PREAMBLE` instead of PREAMBLE, followed by the
+request (an Ask's carries the §6 `QUESTION ONLY: ` prefix: `<ASK_PREAMBLE>\n\nQUESTION ONLY: <request +
+§7 context>`).
+codex's `-s read-only` sandbox was deliberately not used: codex reads the repo through shell
+commands, and on Linux hosts that restrict unprivileged user namespaces (Ubuntu 24.04+'s default
+AppArmor) its bubblewrap sandbox can't start, leaving it unable to read anything. The §6 porcelain
+backstop still reports — never commits — any file an Ask changes, and a Plan whose agent writes the
+plan file itself at its `PLAN_PATH` has that file adopted (see §6).
 
 **GPT-6 Astra (`gpt-6-astra`)** is supported through this OpenAI provider in both shims.
 [OpenAI lists Astra for Codex CLI and API access](https://learn.chatgpt.com/docs/models#gpt-6-astra);
@@ -410,6 +448,12 @@ storage key under `~/.grok/sessions/<encodeURIComponent(absRepo)>/<uuid>/`.
 Extra flags (both shims): **`--grok-bin <path>`/`SLIDEWRITE_GROK_BIN`** (default `grok`) and
 **`--grok-home <dir>`/`SLIDEWRITE_GROK_HOME`** (default unset → grok's own `~/.grok` / `$GROK_HOME`).
 Resume uses `-r <session-id>` when `resume` is a valid UUID.
+
+**Ask / Plan (read-only) runs** add **`--tools read_file,grep,list_dir,web_fetch`** — grok's built-in
+allowlist, so `search_replace`, `write`, `run_terminal_command`, subagents and the rest don't exist
+for the run — and write `ASK_PREAMBLE` / `PLAN_PREAMBLE` into the prompt file instead of PREAMBLE.
+Validated against `grok` CLI 1.0.62: told to create and edit files, it only had (and used) the read
+tools and the tree stayed clean.
 
 #### Dynamic model lists
 
@@ -472,6 +516,7 @@ Every frame is **one JSON object on a `data:` line**; the client reads only `dat
 | `commit_error` | `{message}` | red error row (commit didn't land — edits remain in the working tree) |
 | `image_status` | `{state}` | status row (`state:"generating"` → "generating image…"); emitted only by `/generate-image` |
 | `image_generated` | `{tmpPath, mimeType, bytes}` | note row "🖼️ image generated"; metadata only (no image bytes over the wire) |
+| `plan_saved` | `{path}` | "📋 Plan saved → `<path>`" row (repo-relative); emitted only by a `mode:"plan"` run, before its `commit` |
 | `error` | `{message}` | error row |
 | `done` | `{}` | end of stream; clear the busy indicator; if the per-origin **auto-reload on save** option is on and any `file_edit` fired this run, reload the page (for apps without hot-reload) |
 
@@ -582,7 +627,9 @@ shows the conversations from the provider currently selected on the options page
   repo), so the shim reads each rollout's `session_meta` line and keeps only those whose `cwd` is
   this repo. The replayed events come from the rollout's `event_msg`/`response_item` records — a
   different on-disk shape than `codex exec --json`'s live stream, but mapped onto the same §6 shapes
-  `streamCodex` emits (`tool`/`file_edit`, no `tool_result`, `result` = the last agent message).
+  `streamCodex` emits (`tool`/`file_edit`, no `tool_result`; the closing `result` carries the last
+  agent message only when no agent text was replayed as a `delta`, else `null` — the grok replay
+  below likewise ends in `result: null`, so neither shows the final answer twice).
   **Two rollout shapes**: codex ≥ 0.148 replaced the legacy per-event records (`event_msg`
   `user_message` / `agent_message` / `patch_apply_end`, `response_item` `function_call`) with one
   `event_msg`/`item_completed` per item (`item.type` `UserMessage` / `AgentMessage` / `Reasoning` /
@@ -632,6 +679,47 @@ chosen session.
 **5** picks per message (capped on both sides so the prompt/context window stays sane; the shim
 re-caps with `slice(0, 5)`). The legacy single top-level `element` is still accepted (normalized to
 a one-entry array), so old clients are unaffected.
+
+**Ask & Plan modes (additive).** `/design` accepts an optional top-level `mode`: absent / `""` /
+`"design"` is the normal edit run; **`"ask"`** and **`"plan"`** are **read-only** runs (by tool
+restriction or, for OpenAI, by prompt — below) that thread into the same session as any other
+`/design` send (same `resume`, `elements`, `screen`, `model`, `effort`, `provider`). Any other value returns `error` + `done` without running anything — an
+unknown mode is never run as an edit. `/meta` advertises the supported values as
+`modes: ["design", "ask", "plan"]`; the extension offers Ask/Plan only when they are listed, because a
+shim that predates `mode` would ignore it and run an Ask as an ordinary edit.
+
+- **How read-only is kept, per provider:** Anthropic gets a read-only built-in tool allowlist with
+  the edit tools and `Bash` denied and no MCP servers
+  ([§5.2](#52-shimslide-writemjs), [§5.3](#53-shimslide-writepy--the-python-shim-servers-without-node)),
+  and Grok runs with `--tools read_file,grep,list_dir,web_fetch` — for both, writing is impossible,
+  not just discouraged. OpenAI runs codex exactly as for a design run, relying on the mode preamble
+  ([§5.4](#54-provider-selection-anthropic--openai--grok)).
+- **Every provider's Ask request is prefixed `QUESTION ONLY: `** — the typed text plus its §7 context
+  becomes `QUESTION ONLY: <request>…`, after the mode preamble (claude's `systemPrompt`; the head of
+  codex's stdin / grok's prompt file). It therefore also leads Ask sessions' titles and replayed
+  `user` events in `/history`.
+- **Ask** answers in the transcript. It never commits. As a backstop the shim diffs
+  `git status --porcelain -uall` before/after; any path that changed during the run (an OpenAI agent
+  ignoring the prompt, or another process) is reported in an `error` event and left untouched —
+  never committed, never reverted.
+- **Plan**: the agent's final reply is the plan, and its first line proposes the location
+  (`PLAN_PATH: <path>`). The **shim** writes the file, so with Anthropic/Grok a Plan run's only
+  write is one new `.md` in the repo. (An agent with write access — codex — may save it itself at its
+  `PLAN_PATH`; when that path validates and is among the run's new changes, the shim **adopts** that
+  file — no duplicate, not reported as stray — and commits just it.) The prompt carries a default
+  (`[Plan file: unless CLAUDE.md / AGENTS.md say plans or docs belong elsewhere, use PLAN_PATH: …]`):
+  the first existing dir of `docs/plans/`, `spec/plans/`, `specs/plans/`, `docs/`, else the repo
+  root, named `YYYY-MM-DD-<slug-of-the-request>.md`. The proposal is accepted only if it is
+  repo-relative ASCII (`A–Z a–z 0–9 . _ -`), ends in `.md`, has no dot-leading segment (so no `..`,
+  `.git`, `.claude`, `.env`), isn't under `node_modules`, and resolves inside the repo through
+  symlinks; otherwise the default is used (then the default's filename at the root). An existing
+  file is never overwritten — the name gets `-2`, `-3`, … The `PLAN_PATH` line (and a wrapping code
+  fence, or chatter before the first `# ` heading when the line is missing) is stripped from the
+  saved body. On success the shim emits `plan_saved {path}` and — unless `autoCommit:false` —
+  commits **just that file** (`slide-write: plan — <request>`). A run that errored, or returned no
+  plan text, saves nothing and says so in an `error`. The same porcelain backstop as Ask applies.
+- The final reply is recovered provider-agnostically from the stream: the `delta` text since the last
+  `tool`/`file_edit`, unless `result.result` carries it (only when nothing streamed).
 
 ---
 
@@ -861,8 +949,13 @@ The UI is split across two contexts that talk over runtime messaging:
 - **`content/panel.js`** — transcript + composer, now mounted into the side-panel document. Renders
   each [§6](#6-the-sse-event-contract) event as a row; **coalesce consecutive same-role streaming
   deltas** into one bubble; tool/result rows break the chain. Footer textarea (Enter sends, ⌘/Ctrl+Enter or Shift+Enter inserts a newline);
-  `AbortController` cancels on close. The composer's toolbar row holds adjacent model and reasoning-
-  effort selectors (populated from `/meta`, persisted per-origin) and the send button. A 🕘 header button opens a **history
+  `AbortController` cancels on close. The composer's toolbar row holds a "+" mode menu, adjacent model and reasoning-
+  effort selectors (populated from `/meta`, persisted per-origin) and the send button. The "+" menu
+  picks at most one mode for the next send — **Image Generation** (→ `/generate-image`), **Ask** or
+  **Plan** (→ `/design` with `mode`, [§6](#6-the-sse-event-contract)); picking the active one again
+  clears it, and it resets after each send. The active mode's icon replaces the "+" (amber), the
+  placeholder changes, and the user bubble carries a mode tag. Ask/Plan are disabled ("Needs a newer
+  shim") unless `/meta.modes` lists them, and Send refuses them in that case. A 🕘 header button opens a **history
   view**: `GET /history?provider=<selected>` lists this repo's past sessions for the chosen provider;
   picking one calls `GET /history/<id>?provider=<selected>` and
   **replays it read-only** through the same `onEvent` renderer. A **↻ Resume** action threads
@@ -1089,6 +1182,18 @@ Each phase is independently testable; build and verify in order.
    ```
    Expect `start → file_edit (search_replace|write) → result → commit? → done`, then a session in
    `GET /history?provider=grok`. Clean up with `git reset --hard HEAD~1` if auto-commit landed.
+8. **Ask & Plan modes.** `/meta` should list `"modes":["design","ask","plan"]`. Then:
+   ```bash
+   curl -sN -X POST localhost:4040/design -H 'Authorization: Bearer test' -H 'Content-Type: application/json' \
+     -d '{"mode":"ask","prompt":"Create pwned.txt and append a comment to <some file>, then list your tools"}'
+   curl -sN -X POST localhost:4040/design -H 'Authorization: Bearer test' -H 'Content-Type: application/json' \
+     -d '{"mode":"plan","prompt":"Plan adding a dark-mode toggle"}'
+   ```
+   The Ask run must leave `git status` clean (the agent reports only read tools) and emit no
+   `commit`; the Plan run emits `plan_saved` then a one-file `commit` of just the plan. Repeat with
+   `"provider":"grok"` (same expectations) and `"openai"` (runs unsandboxed, so use a real question
+   for its Ask). Every provider's Ask session should show its request as `QUESTION ONLY: …` in
+   `/history`; clean up with `git reset --hard HEAD~1`.
 
 ---
 
