@@ -87,6 +87,7 @@ body { background: #14141b; color: #e6e6ef; }
 .dmsg-bubble { max-width: 92%; padding: 7px 10px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; }
 .dmsg-bubbletext { white-space: pre-wrap; }
 .dmsg-user { align-self: flex-end; background: #2f3aa0; color: #fff; }
+.dmsg-user ::selection, .dmsg-user::selection { background: #fff; color: #2f3aa0; }
 .dmsg-assistant { align-self: flex-start; background: #23232f; }
 .dmsg-thinking { align-self: flex-start; background: #1c1c26; color: #8f8fa6; font-style: italic; }
 
