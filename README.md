@@ -798,6 +798,13 @@ the shim swaps the "screenshot of the selected element" wording for neutral "[Th
 image…]" wording so `claude` decides from the request whether it's a visual reference or an asset to
 place.
 
+**Sent chips & lightbox (UI only).** Sending clears the composer's chips and re-renders a read-only
+copy of them in the transcript, stacked above that message's user bubble. The copy mirrors what went
+over the wire: on `/design` each element's screenshot, on `/generate-image` its `imageDataUrl` (the
+screenshots were stripped). Clicking any thumbnail — composer or transcript — opens the image in a
+full-panel lightbox (Esc / ✕ / backdrop closes; click the image to toggle actual size when it was
+shrunk to fit). The shim persists no captures, so a history replay shows only the prompt text.
+
 ---
 
 ## 8. The browser extension (`extension/`)

@@ -557,7 +557,62 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
     el("div", { class: "dmsg-diag-actions" }, [diagRetry, diagSettings]),
   ]);
 
-  const panel = el("div", { class: "dmsg-panel", "data-slidewrite-ui": "" }, [header, diag, setup, transcript, historyView, composer]);
+  // Lightbox — previews an attachment chip's pixels (composer or transcript) over the whole panel.
+  // The image fits the stage; when that shrank it, clicking it toggles actual size (scrollable).
+  // Closes on ✕, Esc, or a click on the backdrop around the image.
+  const lbCaption = el("span", { class: "dmsg-lightbox-caption" });
+  const lbImg = el("img", { class: "dmsg-lightbox-img", alt: "" });
+  const lbStage = el("div", { class: "dmsg-lightbox-stage" }, [lbImg]);
+  const lbClose = el("button", { class: "dmsg-iconbtn", text: "✕", title: "Close (Esc)", onclick: () => closeLightbox() });
+  const lightbox = el("div", { class: "dmsg-lightbox", hidden: "", role: "dialog", "aria-modal": "true", "aria-label": "Image preview" }, [
+    el("div", { class: "dmsg-lightbox-bar" }, [lbCaption, lbClose]),
+    lbStage,
+  ]);
+  let lbReturnFocus = null;
+  // "Shrunk to fit" is measured against the rendered size, so it's only meaningful in fit mode.
+  const lbShrunk = () => lbImg.naturalWidth > lbImg.clientWidth + 1 || lbImg.naturalHeight > lbImg.clientHeight + 1;
+  function lbSyncZoom() {
+    const actual = lbStage.classList.contains("dmsg-lightbox-actual");
+    const zoomable = actual || lbShrunk();
+    lbStage.classList.toggle("dmsg-lightbox-zoomable", zoomable);
+    lbImg.title = !zoomable ? "" : actual ? "Click to fit" : "Click for actual size";
+  }
+  lbImg.addEventListener("load", lbSyncZoom);
+  lbImg.addEventListener("click", () => {
+    if (!lbStage.classList.contains("dmsg-lightbox-zoomable")) return;
+    lbStage.classList.toggle("dmsg-lightbox-actual");
+    lbSyncZoom();
+  });
+  lbStage.addEventListener("click", (e) => { if (e.target === lbStage) closeLightbox(); });
+  // Capture phase on document so Esc closes only the lightbox — it never reaches the composer's
+  // menu handler or sidepanel.js's picker-disarm listener.
+  function onLightboxKey(e) {
+    if (e.key !== "Escape") return;
+    e.preventDefault(); e.stopPropagation();
+    closeLightbox();
+  }
+  function openLightbox(url, caption) {
+    if (!url) return;
+    if (lightbox.hidden) lbReturnFocus = document.activeElement;
+    lbCaption.textContent = caption || "";
+    lbCaption.title = caption || "";
+    lbStage.classList.remove("dmsg-lightbox-actual", "dmsg-lightbox-zoomable");
+    lbImg.alt = caption || "";
+    lbImg.src = url;
+    lightbox.hidden = false;
+    document.addEventListener("keydown", onLightboxKey, true);
+    lbClose.focus();
+  }
+  function closeLightbox() {
+    if (lightbox.hidden) return;
+    lightbox.hidden = true;
+    lbImg.removeAttribute("src");   // re-opening the same image must fire `load` again
+    document.removeEventListener("keydown", onLightboxKey, true);
+    if (lbReturnFocus && lbReturnFocus.isConnected) lbReturnFocus.focus();
+    lbReturnFocus = null;
+  }
+
+  const panel = el("div", { class: "dmsg-panel", "data-slidewrite-ui": "" }, [header, diag, setup, transcript, historyView, composer, lightbox]);
   root.append(panel);
 
   // Status text is two layers: `baseStatus` is the persistent connection/run state (set via
@@ -922,10 +977,14 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   function dispatch(intent) {
     const { prompt, mode, elements, model, effort } = intent;
     const info = modeInfo(mode);
-    addRow(el("div", { class: "dmsg-bubble dmsg-user" }, [
+    const bubble = el("div", { class: "dmsg-bubble dmsg-user" }, [
       info ? el("div", { class: "dmsg-bubblemode", text: `${info.icon} ${info.label}` }) : null,
       el("div", { class: "dmsg-bubbletext", text: prompt }),
-    ]));
+    ]);
+    // The composer chips were cleared by readComposer; re-show the ones this send carried, read-only,
+    // stacked above the bubble as one right-aligned message.
+    const chips = sentChips(elements, mode);
+    addRow(chips ? el("div", { class: "dmsg-usermsg" }, [chips, bubble]) : bubble);
     // Re-checked for queued sends: /meta may have changed (e.g. an older shim restarted) since.
     if (!modeSupported(cfg.meta, mode)) {
       onEvent({ type: "error", message: `not sent — ${info.label} needs a newer slide-write shim` });
@@ -998,6 +1057,27 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
   // CSS (.dmsg-chiptext), and the full string is exposed via the chip's title on hover.
   const ctxLabel = (ctx) =>
     ctx.domPath || [ctx.tag, ctx.id ? `#${ctx.id}` : "", ctx.className ? `.${String(ctx.className).split(/\s+/).join(".")}` : ""].join("");
+  // Chip builders shared by the composer stack (editable — pass a ✕ `removeBtn`) and the
+  // transcript's read-only copy of what a send carried (no button; `dmsg-chip-ro`).
+  const removeBtn = (title, onclick) => el("button", { class: "dmsg-iconbtn", text: "✕", title, onclick });
+  function identityChip(ctx, icon, remove) {
+    const chipText = `${icon} ${ctxLabel(ctx) || "element"}${ctx.text ? ` — "${ctx.text.slice(0, 40)}"` : ""}`;
+    return el("div", { class: `dmsg-chip${remove ? "" : " dmsg-chip-ro"}` }, [
+      el("span", { class: "dmsg-chiptext", text: chipText, title: chipText }),
+      remove || null,
+    ]);
+  }
+  // Attachment chip: a clickable thumbnail (opens the lightbox) + "label · W×H". When the
+  // dimensions aren't known up front (an <img>'s imageDataUrl), they're filled in once it decodes.
+  function shotChip(url, label, w, h, remove) {
+    const text = el("span", { class: "dmsg-chiptext", text: w && h ? `${label} · ${w}×${h}` : label });
+    const img = el("img", { class: "dmsg-shotthumb", src: url, alt: "" });
+    if (!(w && h)) img.addEventListener("load", () => { text.textContent = `${label} · ${img.naturalWidth}×${img.naturalHeight}`; }, { once: true });
+    const thumb = el("button", { class: "dmsg-shotbtn", title: "View full size",
+      onclick: () => openLightbox(url, text.textContent) }, [img]);
+    return el("div", { class: `dmsg-chip dmsg-shotchip${remove ? "" : " dmsg-chip-ro"}` }, [thumb, text, remove || null]);
+  }
+
   // Re-render the whole element-chip stack: per picked element an identity chip (✕ removes that
   // element) and, when a capture was taken, a screenshot chip (thumbnail + dimensions + ✕; removing
   // it drops the pixels off that element so they're never sent). The icon reflects image mode
@@ -1010,25 +1090,35 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       // removes the whole entry (clearScreenshot would strand an invisible entry that still counts
       // against the cap and still sends imageDataUrl).
       if (ctx.pasted) {
-        ctxChips.append(el("div", { class: "dmsg-chip dmsg-shotchip" }, [
-          el("img", { class: "dmsg-shotthumb", src: ctx.screenshotDataUrl, alt: "" }),
-          el("span", { class: "dmsg-chiptext", text: `📋 pasted image · ${ctx.screenshotW}×${ctx.screenshotH}` }),
-          el("button", { class: "dmsg-iconbtn", text: "✕", title: "Remove pasted image", onclick: () => removeElement(i) }),
-        ]));
+        ctxChips.append(shotChip(ctx.screenshotDataUrl, "📋 pasted image", ctx.screenshotW, ctx.screenshotH,
+          removeBtn("Remove pasted image", () => removeElement(i))));
         return;
       }
-      const chipText = `${icon} ${ctxLabel(ctx) || "element"}${ctx.text ? ` — "${ctx.text.slice(0, 40)}"` : ""}`;
-      ctxChips.append(el("div", { class: "dmsg-chip" }, [
-        el("span", { class: "dmsg-chiptext", text: chipText, title: chipText }),
-        el("button", { class: "dmsg-iconbtn", text: "✕", title: "Remove element", onclick: () => removeElement(i) }),
-      ]));
-      if (ctx.screenshotDataUrl) ctxChips.append(el("div", { class: "dmsg-chip dmsg-shotchip" }, [
-        el("img", { class: "dmsg-shotthumb", src: ctx.screenshotDataUrl, alt: "" }),
-        el("span", { class: "dmsg-chiptext", text: `screenshot · ${ctx.screenshotW}×${ctx.screenshotH}` }),
-        el("button", { class: "dmsg-iconbtn", text: "✕", title: "Remove screenshot — won’t be sent", onclick: () => clearScreenshot(i) }),
-      ]));
+      ctxChips.append(identityChip(ctx, icon, removeBtn("Remove element", () => removeElement(i))));
+      if (ctx.screenshotDataUrl) ctxChips.append(shotChip(ctx.screenshotDataUrl, "screenshot", ctx.screenshotW, ctx.screenshotH,
+        removeBtn("Remove screenshot — won’t be sent", () => clearScreenshot(i))));
     });
     ctxChips.hidden = !elementCtxs.length;
+  }
+
+  // Read-only copy of one send's chips, rendered in the transcript above its user bubble. Mirrors
+  // what actually went over the wire (see dispatch): /design carries each screenshotDataUrl;
+  // /generate-image strips those and carries imageDataUrl instead (the picked <img>'s pixels, or the
+  // pasted image) — so each thumbnail opens exactly the pixels the shim received. Null if empty.
+  function sentChips(elements, mode) {
+    const image = mode === "image";
+    const icon = image ? "🖼️" : "🎯";
+    const box = el("div", { class: "dmsg-sentchips" });
+    for (const ctx of elements) {
+      const url = image ? ctx.imageDataUrl : ctx.screenshotDataUrl;
+      if (ctx.pasted) {
+        if (url) box.append(shotChip(url, "📋 pasted image", ctx.screenshotW, ctx.screenshotH));
+        continue;
+      }
+      box.append(identityChip(ctx, icon));
+      if (url) box.append(image ? shotChip(url, "source image") : shotChip(url, "screenshot", ctx.screenshotW, ctx.screenshotH));
+    }
+    return box.childElementCount ? box : null;
   }
   function removeElement(i) {
     elementCtxs.splice(i, 1);
@@ -1190,10 +1280,12 @@ export function createPanel({ root, shimUrl, token, meta, conn, provider, model,
       toggleModelMenu(false);
       toggleEffortMenu(false);
       togglePlusMenu(false);
+      closeLightbox();
     },
     destroy() {
       active = false;
       stopPolling();
+      closeLightbox();
       if (spinTimer) { clearInterval(spinTimer); spinTimer = null; }
       if (controller) controller.abort();
       document.removeEventListener("click", closeMenus);

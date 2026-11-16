@@ -139,7 +139,35 @@ body { background: #14141b; color: #e6e6ef; }
 /* Stack of picked-element chips (≤5 picks, each + an optional screenshot chip); scrolls past ~⅓ panel height. */
 .dmsg-chips { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; border-bottom: 1px dashed #2c2c3a; padding-bottom: 8px; }
 .dmsg-chiptext { flex: 1; min-width: 0; color: #c9c9dd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dmsg-shotthumb { height: 28px; max-width: 64px; border-radius: 4px; object-fit: cover; border: 1px solid #3a3a4a; flex: none; }
+.dmsg-shotthumb { height: 28px; max-width: 64px; border-radius: 4px; object-fit: cover; border: 1px solid #3a3a4a; flex: none; display: block; }
+/* Thumbnails are buttons — click (or Enter) opens the full image in the lightbox. */
+.dmsg-shotbtn { flex: none; display: inline-flex; padding: 0; border: none; background: none; border-radius: 4px; cursor: zoom-in; }
+.dmsg-shotbtn:hover .dmsg-shotthumb { border-color: #8a8aa0; }
+.dmsg-shotbtn:focus-visible { outline: 2px solid #cc7a5b; outline-offset: 1px; }
+
+/* A sent message: its read-only chips stacked above the user bubble, right-aligned as one unit.
+   The chips stretch to the widest one so the stack reads as a tidy column. */
+.dmsg-usermsg { align-self: flex-end; max-width: 92%; min-width: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.dmsg-usermsg > .dmsg-bubble { max-width: 100%; }
+.dmsg-sentchips { display: flex; flex-direction: column; gap: 4px; max-width: 100%; min-width: 0; }
+/* Read-only chip — no ✕, so pad to the editable chip's height and mute it slightly. */
+.dmsg-chip-ro { background: #1c1c27; border-color: #30303f; min-height: 28px; }
+.dmsg-chip-ro.dmsg-shotchip { min-height: 38px; }
+
+/* Lightbox — full-panel overlay previewing an attachment. The image fits the stage by default
+   (margin:auto centers it without clipping once it overflows); .dmsg-lightbox-actual shows it at
+   natural size and the stage scrolls. The checkerboard shows through transparent pixels. */
+.dmsg-lightbox { position: absolute; inset: 0; z-index: 20; display: flex; flex-direction: column; background: rgba(8, 8, 12, .95); }
+.dmsg-lightbox-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #2c2c3a; background: #1b1b25; flex-shrink: 0; }
+.dmsg-lightbox-caption { flex: 1; min-width: 0; color: #c9c9dd; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmsg-lightbox-stage { flex: 1; min-height: 0; overflow: auto; display: flex; padding: 16px; }
+.dmsg-lightbox-img {
+  margin: auto; max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .6);
+  background: repeating-conic-gradient(#2a2a36 0 25%, #1f1f29 0 50%) 0 0 / 16px 16px;
+}
+.dmsg-lightbox-zoomable .dmsg-lightbox-img { cursor: zoom-in; }
+.dmsg-lightbox-actual .dmsg-lightbox-img { max-width: none; max-height: none; cursor: zoom-out; }
 
 /* Queued follow-ups typed while a run is in flight — one pending row each, drained at run end. */
 .dmsg-queued { display: flex; flex-direction: column; gap: 6px; max-height: 160px; overflow-y: auto; border-bottom: 1px dashed #2c2c3a; padding-bottom: 8px; }
