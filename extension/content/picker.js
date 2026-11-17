@@ -191,7 +191,7 @@ export function startPicker(onPick, { captureImage = false, copyPath = false } =
     if (!hit) return;                 // our own UI / nothing pickable — let the click through, stay armed
     suppress(e);
     // Copy the full selector to the clipboard only on Shift+click, and only when the global
-    // "copy path" setting is on (parity with the §8.5 CDP picker). A plain click just picks for the
+    // "copy path" setting is on. A plain click just picks for the
     // chat. The async Clipboard API works because we're inside the user's click gesture.
     const copied = copyPath && e.shiftKey;
     if (copied) copyToClipboard(buildFullPath(hit));

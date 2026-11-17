@@ -22,12 +22,7 @@ capped at 5 on both sides, with the legacy single `element` still accepted), and
 (`shim/slide-write.py`, README §5.3: a stdlib-only Python 3.10+ port for hosts without Node — same
 flags/env/routes/contracts, drives the `claude` CLI headless via `-p --output-format stream-json`
 instead of the Agent SDK; `slide-write.mjs` is the reference implementation and the two must change
-together), and an **opt-in `chrome.debugger` picker** (README §8.5: the per-origin `debuggerPicker`
-checkbox routes the 🎯 button through the Chrome DevTools Protocol in `background.js` — now an ES
-module importing `content/capture.js` — instead of the content-script picker; needs the `debugger`
-permission, declared **required** in the manifest because Chrome forbids `debugger` as optional, so it
-ships always-granted with the broader install warning; it reaches cross-origin iframes, and both
-backends emit the identical §7 contract so nothing downstream changes), and **Ask / Plan modes**
+together), and **Ask / Plan modes**
 (README §6 "Ask & Plan modes": the composer's "+" menu holds Image Generation / Ask / Plan as one
 per-send mode; Ask/Plan POST `/design` with a top-level `mode`, advertised in `/meta.modes`, and run
 read-only — tool-enforced for Anthropic/Grok, prompt-only for OpenAI — Ask just answers; Plan's final
@@ -44,10 +39,8 @@ as long as they honor the contracts.
   target repo. Reuses `~/.claude` (no API key). Auto-commits only the files it edits (no push).
 - `extension/` — Manifest V3 browser extension; the universal, framework-agnostic UI. The **chat
   panel lives in the browser side panel** (`sidepanel.html`/`sidepanel.js`, an extension page that
-  persists while open); the **element picker defaults to a content script** in the page
-  (`content/inject.js`, a picker-only bridge), with an **opt-in `chrome.debugger` backend** (§8.5,
-  driven from `background.js` + `content/capture.js`) as the per-origin alternative. The two
-  coordinate over runtime messaging. The side panel talks HTTP+SSE to the shim at
+  persists while open); the **element picker is a content script** in the page
+  (`content/inject.js`, a picker-only bridge). The two coordinate over runtime messaging. The side panel talks HTTP+SSE to the shim at
   `http://localhost:<port>`.
 
 **Transport = VS Code port forwarding.** The shim binds loopback on whatever machine the code lives
@@ -102,17 +95,12 @@ the dev server hot-reloads.
   ["project"]`). Keep the shim's `PREAMBLE` generic — no project specifics here.
 - **The SSE event contract (README §6) and element-capture contract (README §7)** are the
   shim↔extension interface — change both sides together. New SSE `type`s are backward-compatible.
-- **The default content-script picker listens on `window` in the capture phase** and tags its own UI
+- **The content-script picker listens on `window` in the capture phase** and tags its own UI
   with `data-slidewrite-ui` — marking an element must never trigger the app's own handlers.
   Suppression is per-target: clicks on `data-slidewrite-ui` nodes (the picker's highlight overlay) and
   bare body/html pass through. The content script (`inject.js`) is a picker bridge only: it
   arms/disarms on `sw-arm-picker`/`sw-disarm-picker` from the side panel, crops the element screenshot
-  (needs the page's window dims), and posts `sw-element-picked`/`sw-picker-state` back. The opt-in
-  `chrome.debugger` backend (§8.5) bypasses all of this — it uses the browser's native inspector
-  overlay (no in-page UI, no window listener) and is armed via `sw-picker-start`/`sw-picker-stop` to
-  `background.js` — but it posts the **same** `sw-element-picked`/`sw-picker-state` (plus
-  `sw-picker-error`) and emits the same §7 contract, so the two backends are interchangeable to the
-  side panel and everything downstream.
+  (needs the page's window dims), and posts `sw-element-picked`/`sw-picker-state` back.
 
 ## Build / run
 - Shim: `cd shim && npm install`, then

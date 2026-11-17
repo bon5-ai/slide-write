@@ -741,12 +741,6 @@ shim also still accepts the legacy single top-level `element`. Each entry:
   "text": "New",                    // textContent, trimmed, ≤120 chars
   "domPath": "div.topbar > button.btn.btn-primary",  // nth-of-type chain, ≤5 ancestors, stops at first id
   "rect": { "x": 1180, "y": 16, "w": 64, "h": 32 },
-  "matchedStyles": [                              // optional; CDP picker only (§8.5) — authored CSS that applies
-    { "selector": ".btn-primary",                //   winning rule first; user-agent/injected rules dropped
-      "source": "/src/components/Button.module.css",  // dev-server URL; strip origin/query → repo path
-      "line": 42,                                //   1-based, within `source`
-      "sourceMapURL": "Button.module.css.map",   //   optional; present for SCSS / extracted CSS-in-JS (unresolved)
-      "props": { "background-color": "#2563eb", "padding": "8px 16px" } } ],
   "imageDataUrl": "data:image/png;base64,…",      // optional; present only when the target is an <img>
   "screenshotDataUrl": "data:image/png;base64,…", // optional; a screenshot of the picked element
   "screenshotW": 64, "screenshotH": 32,           // UI-only (chip label); not forwarded to the shim
@@ -755,19 +749,6 @@ shim also still accepts the legacy single top-level `element`. Each entry:
 ```
 Centralized, semantic class names usually pinpoint the source; for CSS-in-JS / hashed classes, lean
 on `text` + `domPath` + `screen`, or add framework-fiber data ([§8.4](#84-the-widget-the-bridge--remaining-files)).
-
-`matchedStyles` is the strongest "which file/rule do I edit?" signal, and the one field **only the
-[§8.5](#85-opt-in-chromedebugger-picker) `chrome.debugger` picker can produce** — a content
-script has computed styles but not the matching *rule* with its stylesheet origin. While attached the
-background worker calls `CSS.getMatchedStylesForNode`, keeps only authored (`origin: "regular"`) rules
-plus any inline style, orders them winning-rule-first, and maps each rule's `styleSheetId` to its
-sheet header's `sourceURL` (+ the header's `startLine`, so inline `<style>` lines are correct). It's
-capped (≤12 rules, ≤24 props each) to keep the prompt sane, and best-effort — same-process iframes
-resolve, an OOPIF that won't simply omits the field. `source` is a dev-server URL (Vite/webpack add
-the origin and a `?t=` cache-buster); the shim's prompt tells `claude` to strip those to a repo path,
-and `sourceMapURL` is carried but **not yet resolved** (a follow-up could walk it shim-side to reach
-the original `.scss` / styled-component). The content-script picker omits `matchedStyles` entirely, so
-everything downstream treats it as optional.
 
 `screenshotDataUrl` is captured on **every** pick: Chrome has no "screenshot this element" API, so the
 background worker grabs the visible tab (`chrome.tabs.captureVisibleTab`) and the content script crops
@@ -821,7 +802,7 @@ the app's DOM and overlay a highlight. The two halves coordinate over runtime me
   "manifest_version": 3,
   "name": "Slide Write",
   "version": "0.2.x",
-  "permissions": ["storage", "scripting", "sidePanel", "tabs", "debugger"],
+  "permissions": ["storage", "scripting", "sidePanel", "tabs"],
   "host_permissions": ["<all_urls>"],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
@@ -923,10 +904,9 @@ export async function streamDesign(shimUrl, token, payload, onEvent, signal, pat
    `sw-disarm-picker` (🎯 toggled off, or the 5-element cap reached). Build `domPath` as an
    `nth-of-type` chain of ≤5 ancestors, stopping at the first `id`.
 5. **Shift+click copies the full target path** to the clipboard **in addition to** the normal pick —
-   the element is still captured into the chat context (parity with the [§8.5](#85-opt-in-chromedebugger-picker)
-   CDP picker). The copy is gated on two things: the **global `copyPath` setting** (an options-page
-   checkbox, default ON; threaded through to the picker via the `sw-arm-picker` / `sw-picker-start`
-   messages) and the **Shift modifier** on the click. A plain click just picks for the chat. Unlike
+   the element is still captured into the chat context. The copy is gated on two things: the **global
+   `copyPath` setting** (an options-page checkbox, default ON; threaded through to the picker via the
+   `sw-arm-picker` message) and the **Shift modifier** on the click. A plain click just picks for the chat. Unlike
    `domPath`, this path is uncapped and never stops at an `id`: it walks all the way up to `<body>`,
    keeping every class and an `nth-of-type` disambiguator so the result resolves uniquely via
    `document.querySelector`. Uses `navigator.clipboard.writeText` (inside the click gesture) with an
@@ -972,8 +952,7 @@ The UI is split across two contexts that talk over runtime messaging:
 - **`content/sse.js`** — the SSE reader plus `fetchHistory`/`fetchHistoryDetail` JSON GET helpers
   (both pass the per-origin provider as `?provider=` so history matches the selected backend).
 - **`background.js`** — owns `chrome.storage` config; serves get/set to the side panel & options;
-  performs `captureVisibleTab` on request; drives the opt-in `chrome.debugger` picker
-  ([§8.5](#85-opt-in-chromedebugger-picker)); opens the side panel from the toolbar action / command.
+  performs `captureVisibleTab` on request; opens the side panel from the toolbar action / command.
 - **`options.html/js`** — per-origin rows: `{ origin, enabled, token, shimUrl }`.
 - **`styles.css`** — the side-panel document's styles (the panel fills the panel viewport).
 
@@ -981,56 +960,6 @@ The UI is split across two contexts that talk over runtime messaging:
 (`__reactFiber$…`) on the clicked node to recover the component name + `_debugSource` (file:line) in
 dev builds and post it alongside the DOM context — far more precise than class/`domPath` grepping for
 CSS-in-JS / hashed-class projects. Optional, framework-specific.
-
-### 8.5 Opt-in `chrome.debugger` picker
-
-A per-origin alternative to the [§8.3](#83-contentpickerjs--the-element-picker-capture-phase)
-content-script picker, off by default. Enable it with the **"debugger picker"** checkbox on the
-options page (per origin, stored as `origins[<origin>].debuggerPicker`). When on, the side panel
-routes the 🎯 button through `background.js` instead of the page: it sends `sw-picker-start` /
-`sw-picker-stop` to the background worker, which drives the **Chrome DevTools Protocol** via
-`chrome.debugger` — `Overlay.setInspectMode` for the highlight, `DOM.resolveNode` +
-`Runtime.callFunctionOn` to run `swCapture` (`content/capture.js`) in the picked node's own frame,
-`Page.captureScreenshot` (clip) for the thumbnail, and `CSS.getMatchedStylesForNode` (via `DOM.requestNode`,
-with sheet headers tracked from `CSS.styleSheetAdded`) for the [§7](#7-the-element-capture-contract)
-`matchedStyles`. `background.js` is therefore an ES module
-(`"background.type": "module"`) so it can `import` `capture.js`.
-
-Why offer it:
-
-- **Reaches cross-origin iframes.** The native inspector overlay is browser-drawn and descends into
-  every frame, so you can pick elements the in-page content script can't see.
-- **Device-accurate screenshots.** `Page.captureScreenshot` clips to the node's box model — no
-  `devicePixelRatio` / viewport crop math, and it captures beyond the viewport.
-- **Source-located CSS (`matchedStyles`).** Only this backend can hand `claude` the authored rules
-  that actually apply, each with its source file + line — the strongest pointer to *which* file/rule
-  to edit. A content script has computed styles but not the matching rule's stylesheet origin. See
-  [§7](#7-the-element-capture-contract).
-- **Copies the CSS selector on Shift+click** — the uncapped `fullPath`, same as the
-  [§8.3](#83-contentpickerjs--the-element-picker-capture-phase) content-script picker, gated on the
-  global `copyPath` setting. The inspect event (`Overlay.inspectNodeRequested`) carries no modifier
-  state, so the picker mirrors the page's live Shift state into a `window.__swShift` global (set by a
-  capture-phase keydown/keyup listener installed alongside the Escape hook) and reads it at pick time.
-
-Costs / behavior:
-
-- Needs the **`debugger` permission**, declared **required** in the manifest (Chrome forbids
-  `debugger` as an optional permission, so it can't be requested on demand). It's therefore always
-  granted, and the extension shows the broader install-time permission warning — adding it prompts a
-  one-time permission re-acceptance on reload, even for users who never turn the mode on. Chrome also
-  shows a **"Slide Write started debugging this browser"** banner while picking; finishing
-  (🎯/Esc/cap) detaches and clears it.
-- **One debugger slot per tab:** if DevTools (or another debugger) is attached, `attach` fails. The
-  background reports `sw-picker-error`, the panel surfaces it (`panel.notify`, red row), and it
-  **stays in debugger mode** — close DevTools and click 🎯 again (no auto-fallback to the content-script
-  picker).
-- **No content script / no [§8.1](#81-manifestjson) dynamic registration** is needed in this mode —
-  the worker reaches the page directly.
-
-Both backends post the same `sw-picker-state` / `sw-element-picked` messages and produce the **identical
-[§7](#7-the-element-capture-contract) element contract**, so the shim, the [§6](#6-the-sse-event-contract)
-SSE stream, and the composer are unaware of which picker was used (the Python shim is unaffected — the
-picker is extension-only).
 
 ---
 

@@ -14,8 +14,6 @@ function esc(s) {
 // Non-localhost origins need a runtime-granted host permission (manifest grants localhost only).
 // Must be the FIRST await in a click handler — chrome.permissions.request needs the user gesture.
 // Match patterns can't carry a port, so the grant covers the whole host (like the localhost entry).
-// (The chrome.debugger picker's `debugger` permission is NOT requested here: Chrome forbids `debugger`
-// as an optional permission, so it's declared required in the manifest and always granted.)
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 async function requestHost(origin) {
   try {
@@ -44,7 +42,6 @@ async function render() {
         <label><input type="checkbox" class="en" ${c.enabled ? "checked" : ""}/> enabled</label>
         <label title="When on, reload the page after any run that changed a file — for apps without hot-reload"><input type="checkbox" class="ar" ${c.autoReload ? "checked" : ""}/> auto-reload on save</label>
         <label title="When off, runs leave their edits uncommitted in the repo's working tree"><input type="checkbox" class="ac" ${c.autoCommit !== false ? "checked" : ""}/> auto-commit</label>
-        <label title="Use the chrome.debugger inspector instead of the in-page picker — reaches cross-origin iframes and captures device-accurate screenshots; needs the debugger permission and can't run while DevTools is open on the tab"><input type="checkbox" class="dbg" ${c.debuggerPicker ? "checked" : ""}/> debugger picker</label>
         <button class="save primary">Save</button>
         <button class="del danger">Delete</button>
       </div>
@@ -63,7 +60,6 @@ async function render() {
     row.querySelector(".prov").value = c.provider || "anthropic";
     row.querySelector(".save").addEventListener("click", async () => {
       const enabled = row.querySelector(".en").checked;
-      const dbg = row.querySelector(".dbg").checked;
       if (enabled && !(await requestHost(origin)))
         return flash(row.querySelector(".save"), "Permission denied");
       await send({ type: "setOrigin", origin, value: {
@@ -71,7 +67,6 @@ async function render() {
         enabled,
         autoReload: row.querySelector(".ar").checked,
         autoCommit: row.querySelector(".ac").checked,
-        debuggerPicker: dbg,
         token: row.querySelector(".tok").value.trim(),
         shimUrl: row.querySelector(".url").value.trim() || undefined,
         provider: row.querySelector(".prov").value,
@@ -124,7 +119,6 @@ $("add").addEventListener("click", async () => {
   const origin = normOrigin($("a-origin").value);
   if (!origin) return;
   const enabled = $("a-enabled").checked;
-  const dbg = $("a-dbg").checked;
   if (enabled && !(await requestHost(origin)))
     return flash($("add"), "Permission denied");
   await send({ type: "setOrigin", origin, value: {
@@ -132,7 +126,6 @@ $("add").addEventListener("click", async () => {
     enabled,
     autoReload: $("a-autoreload").checked,
     autoCommit: $("a-autocommit").checked,
-    debuggerPicker: dbg,
     token: $("a-token").value.trim(),
     shimUrl: $("a-url").value.trim() || undefined,
     provider: $("a-provider").value,
